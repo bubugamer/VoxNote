@@ -1,5 +1,7 @@
 # Third-Party Notices
 
+[中文版](THIRD_PARTY_NOTICES.zh.md)
+
 VoxNote includes or depends on third-party software and model artifacts. Each
 component remains under its own license. This file is for attribution and does
 not change the license of those third-party components.
