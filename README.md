@@ -1,5 +1,7 @@
 # VoxNote
 
+[English](README.en.md)
+
 VoxNote 是一款 macOS 本地语音转文字应用。它可以把音频、视频和现场录音整理成清晰的文字，适合会议记录、访谈整理、课程笔记、播客转写和视频字幕草稿。
 
 ## 为什么用 VoxNote
