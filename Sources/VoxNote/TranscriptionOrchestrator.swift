@@ -49,6 +49,10 @@ final class TranscriptionOrchestrator: @unchecked Sendable {
     }
 
     func stopRecording() {
+        // Cancel any in-progress start task (covers the mic-permission phase
+        // where fileRecorder.isRecording is still false)
+        currentTask?.cancel()
+        currentTask = nil
         guard fileRecorder.isRecording else { return }
         currentTask = Task { [weak self] in
             await self?.runStopRecording()
@@ -140,6 +144,10 @@ final class TranscriptionOrchestrator: @unchecked Sendable {
     private func runStopRecording() async {
         recordingTimerTask?.cancel()
         recordingTimerTask = nil
+
+        // If cancel() was called concurrently it already stopped the recorder;
+        // bail out rather than emitting a spurious error for a saved file.
+        guard !Task.isCancelled else { return }
 
         guard let recordingURL = fileRecorder.stop() else {
             emit(.error("Recording could not be saved."))
@@ -253,14 +261,18 @@ final class TranscriptionOrchestrator: @unchecked Sendable {
     private func startRecordingTimer(startedAt: Date) {
         recordingTimerTask?.cancel()
         recordingTimerTask = Task { [weak self] in
-            while !Task.isCancelled {
-                try? await Task.sleep(nanoseconds: 200_000_000)
-                guard let self, self.fileRecorder.isRecording else { break }
-                self.emit(.recording(
-                    confirmedText: "",
-                    pendingText: "",
-                    duration: Date().timeIntervalSince(startedAt)
-                ))
+            do {
+                while true {
+                    try await Task.sleep(nanoseconds: 200_000_000)
+                    guard let self, self.fileRecorder.isRecording else { break }
+                    self.emit(.recording(
+                        confirmedText: "",
+                        pendingText: "",
+                        duration: Date().timeIntervalSince(startedAt)
+                    ))
+                }
+            } catch {
+                // Task was cancelled — exit without emitting stale state
             }
         }
     }
@@ -303,14 +315,16 @@ private final class FileAudioRecorder: NSObject, @unchecked Sendable {
         let newRecorder = try AVAudioRecorder(url: url, settings: settings)
         newRecorder.isMeteringEnabled = true
         newRecorder.prepareToRecord()
+
+        // Hold the lock while calling record() so that recorder is visible to
+        // concurrent isRecording / stop() calls the instant recording goes live.
+        lock.lock()
+        defer { lock.unlock() }
         guard newRecorder.record() else {
             throw AppError.exportFailed("Recording could not start.")
         }
-
-        lock.lock()
         recorder = newRecorder
         recordingURL = url
-        lock.unlock()
     }
 
     func stop() -> URL? {
