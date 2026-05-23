@@ -93,6 +93,10 @@ final class MainWindow: NSWindow, NSWindowDelegate {
         transcriptView.update(state: state)
         progressView.update(state: state, selectedFile: selectedFile)
 
+        if case .preparingAudio = state {
+            refreshFolderForCurrentSource()
+        }
+
         if case .completed = state {
             refreshFolderAfterCompletion()
         }
@@ -366,6 +370,11 @@ final class MainWindow: NSWindow, NSWindowDelegate {
     }
 
     private func refreshFolderAfterCompletion() {
+        refreshFolderForCurrentSource()
+        progressView.update(state: latestState, selectedFile: selectedFile)
+    }
+
+    private func refreshFolderForCurrentSource() {
         guard let folder = selectedFolderURL else { return }
         let currentURL = TranscriptionOrchestrator.shared.currentSourceURL
         files = Self.supportedFiles(in: folder)
@@ -374,7 +383,6 @@ final class MainWindow: NSWindow, NSWindowDelegate {
             selectedFile = item
         }
         sidebarView.setFolder(folder, files: files, selected: selectedFile?.url)
-        progressView.update(state: latestState, selectedFile: selectedFile)
     }
 
     private func exportTranscription(as format: ExportFormat) {
@@ -1255,18 +1263,20 @@ private final class RecordingWorkspaceView: NSView {
 
     func prepare(folderName: String) {
         titleLabel.stringValue = "New Recording"
-        subtitleLabel.stringValue = "\(folderName) · recording audio"
+        subtitleLabel.stringValue = "\(folderName) · preparing microphone"
         timerLabel.stringValue = "00:00.00"
-        stateLabel.stringValue = "Recording"
-        doneButton.isEnabled = true
-        setText("")
+        stateLabel.stringValue = "Preparing"
+        doneButton.isEnabled = false
+        setText("Preparing microphone...")
     }
 
     func update(state: VoxTranscriptionState) {
         switch state {
         case .recording(let confirmed, let pending, let duration):
+            subtitleLabel.stringValue = "Recording audio"
             timerLabel.stringValue = Self.timerString(duration)
             stateLabel.stringValue = "Recording"
+            doneButton.isEnabled = true
             setRecordingText(confirmed: confirmed, pending: pending)
             waveView.progress = min(1, duration.truncatingRemainder(dividingBy: 20) / 20)
         case .completed(let text):
@@ -1274,7 +1284,7 @@ private final class RecordingWorkspaceView: NSView {
             doneButton.isEnabled = true
             setText(text)
         case .error(let message):
-            stateLabel.stringValue = "Error"
+            stateLabel.stringValue = "Failed"
             doneButton.isEnabled = true
             setText(message)
         default:

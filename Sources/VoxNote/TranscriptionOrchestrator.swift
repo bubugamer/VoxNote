@@ -13,24 +13,17 @@ final class TranscriptionOrchestrator: @unchecked Sendable {
     private let whisperManager = WhisperKitManager()
     private let speakerManager = SpeakerKitManager()
     private let videoAudioExtractor = VideoAudioExtractor()
-    private let streamingTranscriber = StreamingTranscriber()
+    private let fileRecorder = FileAudioRecorder()
     private let stateLock = NSLock()
 
     private var currentTask: Task<Void, Never>?
+    private var recordingTimerTask: Task<Void, Never>?
     private var currentState: VoxTranscriptionState = .idle
     private(set) var currentSourceName = "Transcription"
     private(set) var currentSourceURL: URL?
     private var recordingDirectoryURL: URL?
 
-    private init() {
-        streamingTranscriber.onStateChange = { [weak self] state in
-            self?.emit(.recording(
-                confirmedText: state.confirmedText,
-                pendingText: state.pendingText,
-                duration: state.duration
-            ))
-        }
-    }
+    private init() {}
 
     func transcribe(fileURL: URL) {
         cancel()
@@ -46,7 +39,7 @@ final class TranscriptionOrchestrator: @unchecked Sendable {
     }
 
     func startRecording() {
-        guard !streamingTranscriber.isRecording else { return }
+        guard !fileRecorder.isRecording else { return }
         cancel()
         currentSourceName = Self.defaultRecordingBaseName()
         currentSourceURL = nil
@@ -56,8 +49,7 @@ final class TranscriptionOrchestrator: @unchecked Sendable {
     }
 
     func stopRecording() {
-        guard streamingTranscriber.isRecording else { return }
-        currentTask?.cancel()
+        guard fileRecorder.isRecording else { return }
         currentTask = Task { [weak self] in
             await self?.runStopRecording()
         }
@@ -66,12 +58,12 @@ final class TranscriptionOrchestrator: @unchecked Sendable {
     func cancel() {
         currentTask?.cancel()
         currentTask = nil
+        recordingTimerTask?.cancel()
+        recordingTimerTask = nil
         whisperManager.cancel()
         speakerManager.cancel()
-        if streamingTranscriber.isRecording {
-            Task {
-                _ = await streamingTranscriber.stopRecording()
-            }
+        if fileRecorder.isRecording {
+            _ = fileRecorder.stop()
         }
     }
 
@@ -121,9 +113,22 @@ final class TranscriptionOrchestrator: @unchecked Sendable {
 
     private func runStartRecording() async {
         do {
-            try await ensureWhisperReady()
+            guard let directory = recordingDirectoryURL else {
+                throw AppError.exportFailed("Choose a folder before recording.")
+            }
+
+            try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+            try await PermissionManager.shared.ensureMicrophoneAccess()
             try Task.checkCancellation()
-            try await streamingTranscriber.startRecording(language: LanguageManager.shared.whisperLanguage)
+
+            let baseName = Self.defaultRecordingBaseName()
+            let outputURL = uniqueFileURL(in: directory, baseName: baseName, extension: "m4a")
+            try fileRecorder.start(url: outputURL)
+
+            currentSourceURL = outputURL
+            currentSourceName = outputURL.deletingPathExtension().lastPathComponent
+            startRecordingTimer(startedAt: Date())
+            emit(.recording(confirmedText: "", pendingText: "", duration: 0))
         } catch is CancellationError {
             emit(.idle)
         } catch {
@@ -133,22 +138,17 @@ final class TranscriptionOrchestrator: @unchecked Sendable {
     }
 
     private func runStopRecording() async {
-        let result = await streamingTranscriber.stopRecording()
-        do {
-            if let recordingURL = try saveRecording(result) {
-                currentSourceURL = recordingURL
-                currentSourceName = recordingURL.deletingPathExtension().lastPathComponent
-            }
-            let text = try await postProcessRecording(result)
-            emit(.completed(text))
-            AppModelManager.shared.scheduleAutoUnload(after: 600)
-        } catch is CancellationError {
-            emit(.idle)
-        } catch {
-            logger.error("Recording post-processing failed: \(error.localizedDescription, privacy: .public)")
-            let fallback = result.finalText.trimmingCharacters(in: .whitespacesAndNewlines)
-            emit(.completed(fallback))
+        recordingTimerTask?.cancel()
+        recordingTimerTask = nil
+
+        guard let recordingURL = fileRecorder.stop() else {
+            emit(.error("Recording could not be saved."))
+            return
         }
+
+        currentSourceURL = recordingURL
+        currentSourceName = recordingURL.deletingPathExtension().lastPathComponent
+        await runFileTranscription(fileURL: recordingURL)
     }
 
     private func ensureWhisperReady() async throws {
@@ -236,68 +236,6 @@ final class TranscriptionOrchestrator: @unchecked Sendable {
         return finalText
     }
 
-    private func postProcessRecording(_ result: StreamingResult) async throws -> String {
-        let fallback = result.finalText.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard !result.audioArray.isEmpty else {
-            return fallback
-        }
-
-        if result.segments.isEmpty {
-            var text = fallback
-            if LLMService.shared.isEnabled && !text.isEmpty {
-                do {
-                    emit(.refining)
-                    text = try await LLMService.shared.refine(text: text)
-                } catch {
-                    logger.error("LLM refinement failed: \(error.localizedDescription, privacy: .public)")
-                }
-            }
-            return text
-        }
-
-        return try await transcribeAndPostProcess(
-            audioArray: result.audioArray,
-            recordingSegments: result.segments,
-            fallbackText: fallback
-        )
-    }
-
-    private func saveRecording(_ result: StreamingResult) throws -> URL? {
-        guard !result.audioArray.isEmpty else { return nil }
-        guard let directory = recordingDirectoryURL else { return nil }
-
-        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
-        let baseName = Self.defaultRecordingBaseName()
-        let outputURL = uniqueFileURL(in: directory, baseName: baseName, extension: "wav")
-
-        guard let format = AVAudioFormat(
-            commonFormat: .pcmFormatFloat32,
-            sampleRate: 16_000,
-            channels: 1,
-            interleaved: false
-        ) else {
-            throw AppError.exportFailed("Could not create a recording audio format.")
-        }
-
-        guard let buffer = AVAudioPCMBuffer(
-            pcmFormat: format,
-            frameCapacity: AVAudioFrameCount(result.audioArray.count)
-        ) else {
-            throw AppError.exportFailed("Could not create a recording audio buffer.")
-        }
-
-        buffer.frameLength = AVAudioFrameCount(result.audioArray.count)
-        if let channel = buffer.floatChannelData?[0] {
-            result.audioArray.withUnsafeBufferPointer { samples in
-                channel.update(from: samples.baseAddress!, count: samples.count)
-            }
-        }
-
-        let file = try AVAudioFile(forWriting: outputURL, settings: format.settings)
-        try file.write(from: buffer)
-        return outputURL
-    }
-
     private func uniqueFileURL(in directory: URL, baseName: String, extension ext: String) -> URL {
         var candidate = directory
             .appendingPathComponent(baseName)
@@ -310,6 +248,21 @@ final class TranscriptionOrchestrator: @unchecked Sendable {
             index += 1
         }
         return candidate
+    }
+
+    private func startRecordingTimer(startedAt: Date) {
+        recordingTimerTask?.cancel()
+        recordingTimerTask = Task { [weak self] in
+            while !Task.isCancelled {
+                try? await Task.sleep(nanoseconds: 200_000_000)
+                guard let self, self.fileRecorder.isRecording else { break }
+                self.emit(.recording(
+                    confirmedText: "",
+                    pendingText: "",
+                    duration: Date().timeIntervalSince(startedAt)
+                ))
+            }
+        }
     }
 
     private static func defaultRecordingBaseName() -> String {
@@ -325,5 +278,50 @@ final class TranscriptionOrchestrator: @unchecked Sendable {
         DispatchQueue.main.async { [weak self] in
             self?.onStateChange?(state)
         }
+    }
+}
+
+private final class FileAudioRecorder: NSObject, @unchecked Sendable {
+    private let lock = NSLock()
+    private var recorder: AVAudioRecorder?
+    private var recordingURL: URL?
+
+    var isRecording: Bool {
+        lock.lock()
+        defer { lock.unlock() }
+        return recorder?.isRecording == true
+    }
+
+    func start(url: URL) throws {
+        let settings: [String: Any] = [
+            AVFormatIDKey: Int(kAudioFormatMPEG4AAC),
+            AVSampleRateKey: 44_100,
+            AVNumberOfChannelsKey: 1,
+            AVEncoderAudioQualityKey: AVAudioQuality.high.rawValue
+        ]
+
+        let newRecorder = try AVAudioRecorder(url: url, settings: settings)
+        newRecorder.isMeteringEnabled = true
+        newRecorder.prepareToRecord()
+        guard newRecorder.record() else {
+            throw AppError.exportFailed("Recording could not start.")
+        }
+
+        lock.lock()
+        recorder = newRecorder
+        recordingURL = url
+        lock.unlock()
+    }
+
+    func stop() -> URL? {
+        lock.lock()
+        let localRecorder = recorder
+        let url = recordingURL
+        recorder = nil
+        recordingURL = nil
+        lock.unlock()
+
+        localRecorder?.stop()
+        return url
     }
 }
