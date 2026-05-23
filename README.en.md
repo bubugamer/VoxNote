@@ -68,4 +68,4 @@ LLM post-correction is an optional feature and is disabled by default. Text is o
 
 ## License
 
-VoxNote is released under the MIT License. For third-party library and model attributions, see [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md) ([中文版](THIRD_PARTY_NOTICES.zh.md)).
+VoxNote is released under the MIT License. For third-party library and model attributions, see [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md).
