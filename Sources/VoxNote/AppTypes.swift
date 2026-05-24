@@ -119,6 +119,7 @@ enum AppError: LocalizedError {
     case microphoneDenied
     case llmNotConfigured
     case invalidLLMResponse
+    case llmTimedOut
 
     var errorDescription: String? {
         switch self {
@@ -136,6 +137,8 @@ enum AppError: LocalizedError {
             return "LLM refinement is enabled, but the API settings are incomplete."
         case .invalidLLMResponse:
             return "The LLM service returned an unexpected response."
+        case .llmTimedOut:
+            return "The LLM service took too long to respond."
         }
     }
 }

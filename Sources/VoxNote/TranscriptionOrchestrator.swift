@@ -232,15 +232,6 @@ final class TranscriptionOrchestrator: @unchecked Sendable {
             emit(.diarizing(progress: 1))
         }
 
-        if LLMService.shared.isEnabled && !finalText.isEmpty {
-            do {
-                emit(.refining)
-                finalText = try await LLMService.shared.refine(text: finalText)
-            } catch {
-                logger.error("LLM refinement failed: \(error.localizedDescription, privacy: .public)")
-            }
-        }
-
         return finalText
     }
 

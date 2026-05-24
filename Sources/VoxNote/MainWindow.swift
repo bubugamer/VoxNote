@@ -1,6 +1,24 @@
 import AVFoundation
 import Cocoa
 import UniformTypeIdentifiers
+import VoxNoteCore
+
+private enum ManualRefineState {
+    case unavailable
+    case ready
+    case refining
+    case refined
+}
+
+private struct ProgressDisplayModel {
+    let leftLabel: String
+    let centerLabel: String
+    let rightLabel: String
+    let progress: Double
+    let elapsed: TimeInterval
+    let buttonTitle: String
+    let buttonEnabled: Bool
+}
 
 @MainActor
 final class MainWindow: NSWindow, NSWindowDelegate {
@@ -19,6 +37,14 @@ final class MainWindow: NSWindow, NSWindowDelegate {
     private var files: [VoxFileItem] = []
     private var selectedFile: VoxFileItem?
     private var latestState: VoxTranscriptionState = .idle
+    private var refineTask: Task<Void, Never>?
+    private var activeRefineID: UUID?
+    private var isRefining = false
+    private var hasRefinedTranscript = false
+    private var refineProgress: RefineProgress?
+    private var elapsedBeforeCurrentRun: TimeInterval = 0
+    private var elapsedRunStartedAt: Date?
+    private var elapsedTimerTask: Task<Void, Never>?
 
     init() {
         let rect = NSRect(x: 0, y: 0, width: 1320, height: 820)
@@ -70,6 +96,7 @@ final class MainWindow: NSWindow, NSWindowDelegate {
     }
 
     func copyAll() {
+        guard !latestState.isBusy else { return }
         transcriptView.copyAll()
     }
 
@@ -90,15 +117,23 @@ final class MainWindow: NSWindow, NSWindowDelegate {
             recordingView.update(state: state)
         }
 
+        if case .completed = state {
+            hasRefinedTranscript = false
+        }
+
         transcriptView.update(state: state)
-        progressView.update(state: state, selectedFile: selectedFile)
+        refreshProgressView()
 
         if case .preparingAudio = state {
             refreshFolderForCurrentSource()
         }
 
         if case .completed = state {
+            stopElapsedTimer()
             refreshFolderAfterCompletion()
+        }
+        if case .error = state {
+            stopElapsedTimer()
         }
 
         updateActionState()
@@ -114,6 +149,12 @@ final class MainWindow: NSWindow, NSWindowDelegate {
     func refreshModelStatus() {
         let manager = AppModelManager.shared
         topModelStatusLabel.stringValue = "Model: \(manager.currentModelInfo.displayName) - \(manager.whisperModelState.displayText)"
+    }
+
+    func refreshSettings() {
+        refreshModelStatus()
+        refreshProgressView()
+        updateActionState()
     }
 
     private func setupContent() {
@@ -252,7 +293,7 @@ final class MainWindow: NSWindow, NSWindowDelegate {
             self?.startRecordingFlow()
         }
         progressView.onStart = { [weak self] in
-            self?.startSelectedTranscription()
+            self?.handleProgressAction()
         }
         recordingView.onDone = { [weak self] in
             self?.finishRecording()
@@ -263,14 +304,14 @@ final class MainWindow: NSWindow, NSWindowDelegate {
         guard let path = UserDefaults.standard.string(forKey: "selectedFolderPath") else {
             sidebarView.setFolder(nil, files: [], selected: nil)
             transcriptView.showEmptyFolder()
-            progressView.update(state: .idle, selectedFile: nil)
+            refreshProgressView()
             return
         }
         let url = URL(fileURLWithPath: path)
         guard FileManager.default.fileExists(atPath: url.path) else {
             sidebarView.setFolder(nil, files: [], selected: nil)
             transcriptView.showEmptyFolder()
-            progressView.update(state: .idle, selectedFile: nil)
+            refreshProgressView()
             return
         }
         loadFolder(url, selecting: nil)
@@ -296,6 +337,8 @@ final class MainWindow: NSWindow, NSWindowDelegate {
     }
 
     private func loadFolder(_ url: URL, selecting selectedURL: URL?) {
+        cancelManualRefine()
+        resetElapsedTimer()
         selectedFolderURL = url
         UserDefaults.standard.set(url.path, forKey: "selectedFolderPath")
 
@@ -305,39 +348,66 @@ final class MainWindow: NSWindow, NSWindowDelegate {
 
         sidebarView.setFolder(url, files: files, selected: target?.url)
         transcriptView.showSelectedFile(target)
-        progressView.update(state: .idle, selectedFile: target)
         latestState = .idle
+        refreshProgressView()
         updateActionState()
     }
 
     private func selectFile(_ item: VoxFileItem) {
+        guard !isRefining else { return }
         selectedFile = item
         sidebarView.select(url: item.url)
         if !latestState.isBusy {
             latestState = .idle
+            hasRefinedTranscript = false
+            resetElapsedTimer()
             transcriptView.showSelectedFile(item)
-            progressView.update(state: .idle, selectedFile: item)
+            refreshProgressView()
             updateActionState()
         }
     }
 
+    private func handleProgressAction() {
+        switch currentRefineState() {
+        case .ready:
+            startManualRefine()
+        case .unavailable:
+            startSelectedTranscription()
+        case .refining:
+            cancelManualRefine()
+        case .refined:
+            break
+        }
+    }
+
     private func startSelectedTranscription() {
-        guard !latestState.isBusy else { return }
+        guard !latestState.isBusy, !isRefining else { return }
         guard let selectedFile else {
             showAlert(title: "Choose a File", message: "Select a supported audio or video file first.")
             return
         }
+        cancelManualRefine()
+        hasRefinedTranscript = false
+        refineProgress = nil
+        resetElapsedTimer()
+        startElapsedTimer()
         transcriptView.showSelectedFile(selectedFile)
+        refreshProgressView()
+        updateActionState()
         TranscriptionOrchestrator.shared.transcribe(fileURL: selectedFile.url)
     }
 
     private func startRecordingFlow() {
-        guard !latestState.isBusy else { return }
+        guard !latestState.isBusy, !isRefining else { return }
         guard selectedFolderURL != nil else {
             chooseFolder(startRecordingAfterSelection: true)
             return
         }
 
+        cancelManualRefine()
+        hasRefinedTranscript = false
+        refineProgress = nil
+        resetElapsedTimer()
         showRecordingMode()
         let folderName = selectedFolderURL?.lastPathComponent ?? "Recordings"
         recordingView.prepare(folderName: folderName)
@@ -352,6 +422,7 @@ final class MainWindow: NSWindow, NSWindowDelegate {
         }
         recordingView.showFinishing()
         showMainMode()
+        startElapsedTimer()
         TranscriptionOrchestrator.shared.stopRecording()
     }
 
@@ -371,7 +442,7 @@ final class MainWindow: NSWindow, NSWindowDelegate {
 
     private func refreshFolderAfterCompletion() {
         refreshFolderForCurrentSource()
-        progressView.update(state: latestState, selectedFile: selectedFile)
+        refreshProgressView()
     }
 
     private func refreshFolderForCurrentSource() {
@@ -385,9 +456,290 @@ final class MainWindow: NSWindow, NSWindowDelegate {
         sidebarView.setFolder(folder, files: files, selected: selectedFile?.url)
     }
 
+    private func startManualRefine() {
+        guard !isRefining, !latestState.isBusy else { return }
+        guard LLMService.shared.isEnabled else {
+            showAlert(title: "Refinement Disabled", message: "Enable LLM Refinement in Settings before sending text to your configured service.")
+            return
+        }
+        guard LLMService.shared.isConfigured else {
+            showAlert(title: "LLM Settings Needed", message: AppError.llmNotConfigured.localizedDescription)
+            return
+        }
+
+        let originalText = transcriptView.currentText
+        guard transcriptView.hasExportableText, !originalText.isEmpty else { return }
+
+        let refineID = UUID()
+        let sourceURL = selectedFile?.url ?? TranscriptionOrchestrator.shared.currentSourceURL
+        activeRefineID = refineID
+        isRefining = true
+        hasRefinedTranscript = false
+        refineProgress = nil
+        transcriptView.showRefining()
+        startElapsedTimer()
+        refreshProgressView()
+        updateActionState()
+
+        refineTask = Task { [weak self] in
+            do {
+                let refinedText = try await Self.refineText(originalText) { [weak self] progress in
+                    await self?.updateManualRefineProgress(progress)
+                }
+                self?.completeManualRefine(
+                    id: refineID,
+                    refinedText: refinedText,
+                    originalText: originalText,
+                    sourceURL: sourceURL
+                )
+            } catch is CancellationError {
+                self?.cancelledManualRefine(id: refineID)
+            } catch {
+                self?.failManualRefine(
+                    id: refineID,
+                    message: error.localizedDescription,
+                    originalText: originalText,
+                    sourceURL: sourceURL
+                )
+            }
+        }
+    }
+
+    private nonisolated static func refineText(
+        _ text: String,
+        onProgress: @escaping @Sendable (RefineProgress) async -> Void
+    ) async throws -> String {
+        try await LLMService.shared.refine(text: text, onProgress: onProgress)
+    }
+
+    private func updateManualRefineProgress(_ progress: RefineProgress) {
+        refineProgress = progress
+        transcriptView.showRefining(current: progress.currentChunk, total: progress.totalChunks)
+        refreshProgressView()
+    }
+
+    private func completeManualRefine(id: UUID, refinedText: String, originalText: String, sourceURL: URL?) {
+        guard finishManualRefine(id: id) else { return }
+        guard shouldApplyRefineResult(originalText: originalText, sourceURL: sourceURL) else { return }
+
+        let trimmed = refinedText.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty else {
+            failVisibleManualRefine(message: AppError.invalidLLMResponse.localizedDescription)
+            return
+        }
+
+        latestState = .completed(trimmed)
+        hasRefinedTranscript = true
+        stopElapsedTimer()
+        transcriptView.showRefined(text: trimmed)
+        refreshProgressView()
+        updateActionState()
+    }
+
+    private func failManualRefine(id: UUID, message: String, originalText: String, sourceURL: URL?) {
+        guard finishManualRefine(id: id) else { return }
+        guard shouldApplyRefineResult(originalText: originalText, sourceURL: sourceURL) else { return }
+        failVisibleManualRefine(message: message)
+    }
+
+    private func failVisibleManualRefine(message: String) {
+        hasRefinedTranscript = false
+        refineProgress = nil
+        stopElapsedTimer()
+        transcriptView.showRefineFailed(message: message)
+        refreshProgressView()
+        updateActionState()
+    }
+
+    private func cancelledManualRefine(id: UUID) {
+        guard finishManualRefine(id: id) else { return }
+        refineProgress = nil
+        stopElapsedTimer()
+        transcriptView.showCompletedStatus()
+        refreshProgressView()
+        updateActionState()
+    }
+
+    private func finishManualRefine(id: UUID) -> Bool {
+        guard activeRefineID == id else { return false }
+        activeRefineID = nil
+        refineTask = nil
+        isRefining = false
+        return true
+    }
+
+    private func cancelManualRefine() {
+        activeRefineID = nil
+        refineTask?.cancel()
+        refineTask = nil
+        isRefining = false
+        refineProgress = nil
+        stopElapsedTimer()
+        if transcriptView.hasExportableText, case .completed = latestState {
+            transcriptView.showCompletedStatus()
+        }
+    }
+
+    private func shouldApplyRefineResult(originalText: String, sourceURL: URL?) -> Bool {
+        guard transcriptView.currentText == originalText else { return false }
+        guard let sourceURL else { return true }
+        return selectedFile?.url.path == sourceURL.path ||
+            TranscriptionOrchestrator.shared.currentSourceURL?.path == sourceURL.path
+    }
+
+    private func currentRefineState() -> ManualRefineState {
+        if isRefining {
+            return .refining
+        }
+        guard case .completed = latestState,
+              transcriptView.hasExportableText,
+              !latestState.isBusy else {
+            return .unavailable
+        }
+        return hasRefinedTranscript ? .refined : .ready
+    }
+
+    private func refreshProgressView() {
+        progressView.update(display: makeProgressDisplayModel())
+    }
+
+    private func makeProgressDisplayModel() -> ProgressDisplayModel {
+        let refineState = currentRefineState()
+        let elapsed = currentElapsedTime()
+
+        if let refineProgress {
+            let isActivelyRefining = refineState == .refining
+            return ProgressDisplayModel(
+                leftLabel: Self.characterCountText(refineProgress.processedCharacters),
+                centerLabel: "\(Int(refineProgress.fraction * 100))%",
+                rightLabel: Self.characterCountText(refineProgress.totalCharacters),
+                progress: refineProgress.fraction,
+                elapsed: elapsed,
+                buttonTitle: isActivelyRefining ? "Cancel Refine" : "Finished",
+                buttonEnabled: isActivelyRefining
+            )
+        }
+
+        let audioProgress = progressValue(for: latestState)
+        let duration = selectedFile?.duration
+        let leftLabel = audioProgress > 0 && duration != nil
+            ? VoxTranscriptionState.formatDuration(audioProgress * Self.durationSeconds(duration))
+            : "0:00"
+        let rightLabel = duration ?? "--:--"
+
+        let buttonTitle: String
+        let buttonEnabled: Bool
+        switch refineState {
+        case .ready:
+            buttonTitle = "Refine"
+            buttonEnabled = true
+        case .refining:
+            buttonTitle = "Cancel Refine"
+            buttonEnabled = true
+        case .refined:
+            buttonTitle = "Finished"
+            buttonEnabled = false
+        case .unavailable:
+            buttonTitle = latestState.isBusy ? "Transcribing" : "Start"
+            buttonEnabled = selectedFile != nil && !latestState.isBusy
+        }
+
+        return ProgressDisplayModel(
+            leftLabel: leftLabel,
+            centerLabel: "\(Int(audioProgress * 100))%",
+            rightLabel: rightLabel,
+            progress: audioProgress,
+            elapsed: elapsed,
+            buttonTitle: buttonTitle,
+            buttonEnabled: buttonEnabled
+        )
+    }
+
+    private func progressValue(for state: VoxTranscriptionState) -> Double {
+        switch state {
+        case .transcribing(let value, _):
+            return value
+        case .downloadingModel(let value):
+            return value
+        case .extractingAudio:
+            return 0
+        case .loadingModel:
+            return 0.01
+        case .preparingAudio:
+            return 0.02
+        case .diarizing(let value):
+            return value
+        case .refining:
+            return 0.96
+        case .completed:
+            return 1
+        case .error, .idle, .recording:
+            return 0
+        }
+    }
+
+    private func startElapsedTimer() {
+        guard elapsedRunStartedAt == nil else { return }
+        elapsedRunStartedAt = Date()
+        elapsedTimerTask?.cancel()
+        elapsedTimerTask = Task { [weak self] in
+            while !Task.isCancelled {
+                try? await Task.sleep(nanoseconds: 200_000_000)
+                self?.refreshProgressView()
+            }
+        }
+    }
+
+    private func stopElapsedTimer() {
+        if let startedAt = elapsedRunStartedAt {
+            elapsedBeforeCurrentRun += Date().timeIntervalSince(startedAt)
+            elapsedRunStartedAt = nil
+        }
+        elapsedTimerTask?.cancel()
+        elapsedTimerTask = nil
+        refreshProgressView()
+    }
+
+    private func resetElapsedTimer() {
+        elapsedTimerTask?.cancel()
+        elapsedTimerTask = nil
+        elapsedRunStartedAt = nil
+        elapsedBeforeCurrentRun = 0
+        refineProgress = nil
+    }
+
+    private func currentElapsedTime() -> TimeInterval {
+        if let startedAt = elapsedRunStartedAt {
+            return elapsedBeforeCurrentRun + Date().timeIntervalSince(startedAt)
+        }
+        return elapsedBeforeCurrentRun
+    }
+
+    private static func characterCountText(_ count: Int) -> String {
+        "\(Self.integerFormatter.string(from: NSNumber(value: count)) ?? "\(count)") chars"
+    }
+
+    private static let integerFormatter: NumberFormatter = {
+        let formatter = NumberFormatter()
+        formatter.numberStyle = .decimal
+        return formatter
+    }()
+
+    private static func durationSeconds(_ duration: String?) -> Double {
+        guard let duration else { return 0 }
+        let parts = duration.split(separator: ":").compactMap { Double($0) }
+        if parts.count == 3 {
+            return parts[0] * 3600 + parts[1] * 60 + parts[2]
+        }
+        if parts.count == 2 {
+            return parts[0] * 60 + parts[1]
+        }
+        return 0
+    }
+
     private func exportTranscription(as format: ExportFormat) {
         let text = transcriptView.currentText
-        guard transcriptView.hasExportableText, !text.isEmpty else { return }
+        guard !latestState.isBusy, transcriptView.hasExportableText, !text.isEmpty else { return }
 
         let sourceName = selectedFile?.url.deletingPathExtension().lastPathComponent
             ?? TranscriptionOrchestrator.shared.currentSourceName
@@ -896,6 +1248,8 @@ private final class TranscriptPanelView: NSView {
     func showEmptyFolder() {
         hasExportableText = false
         statusLabel.stringValue = ""
+        statusLabel.textColor = .secondaryLabelColor
+        statusLabel.toolTip = nil
         titleLabel.stringValue = "Choose a folder"
         subtitleLabel.stringValue = ""
         setText("Choose a folder on the left to show supported audio and video files.", color: .secondaryLabelColor)
@@ -907,6 +1261,8 @@ private final class TranscriptPanelView: NSView {
             return
         }
         statusLabel.stringValue = "Ready"
+        statusLabel.textColor = .secondaryLabelColor
+        statusLabel.toolTip = nil
         titleLabel.stringValue = item.title
         subtitleLabel.stringValue = [item.dateText, item.duration].compactMap(\.self).joined(separator: "  ")
         hasExportableText = false
@@ -919,26 +1275,69 @@ private final class TranscriptPanelView: NSView {
             break
         case .extractingAudio, .loadingModel, .preparingAudio, .diarizing, .refining, .downloadingModel:
             statusLabel.stringValue = state.text
+            statusLabel.textColor = .secondaryLabelColor
+            statusLabel.toolTip = nil
         case .transcribing(_, let partialText):
             statusLabel.stringValue = "Transcribing"
+            statusLabel.textColor = .secondaryLabelColor
+            statusLabel.toolTip = nil
             if !partialText.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
                 hasExportableText = true
                 setText(partialText, color: .labelColor)
             }
         case .recording(let confirmedText, let pendingText, _):
             statusLabel.stringValue = "Recording"
+            statusLabel.textColor = .secondaryLabelColor
+            statusLabel.toolTip = nil
             hasExportableText = !confirmedText.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
                 || !pendingText.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
             setRecordingText(confirmed: confirmedText, pending: pendingText)
         case .completed(let text):
             statusLabel.stringValue = "Completed"
+            statusLabel.textColor = .secondaryLabelColor
+            statusLabel.toolTip = nil
             hasExportableText = !text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
             setText(text.isEmpty ? "No speech was detected." : text, color: .labelColor)
         case .error(let message):
             statusLabel.stringValue = "Error"
+            statusLabel.textColor = .systemRed
+            statusLabel.toolTip = message
             hasExportableText = false
             setText(message, color: .systemRed)
         }
+    }
+
+    func showRefining() {
+        statusLabel.stringValue = "Refining"
+        statusLabel.textColor = .secondaryLabelColor
+        statusLabel.toolTip = nil
+    }
+
+    func showRefining(current: Int, total: Int) {
+        statusLabel.stringValue = "Refining \(current)/\(total)"
+        statusLabel.textColor = .secondaryLabelColor
+        statusLabel.toolTip = nil
+    }
+
+    func showCompletedStatus() {
+        statusLabel.stringValue = "Completed"
+        statusLabel.textColor = .secondaryLabelColor
+        statusLabel.toolTip = nil
+    }
+
+    func showRefined(text: String) {
+        statusLabel.stringValue = "Refined"
+        statusLabel.textColor = .secondaryLabelColor
+        statusLabel.toolTip = nil
+        hasExportableText = !text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+        setText(text, color: .labelColor)
+    }
+
+    func showRefineFailed(message: String) {
+        statusLabel.stringValue = "Refine failed"
+        statusLabel.textColor = .systemRed
+        statusLabel.toolTip = message
+        hasExportableText = !currentText.isEmpty
     }
 
     func copyAll() {
@@ -1084,7 +1483,7 @@ private final class TranscriptionProgressView: NSView {
     private let endLabel = NSTextField.label("--:--", font: .monospacedDigitSystemFont(ofSize: 12, weight: .semibold), color: .secondaryLabelColor)
     private let progressIndicator = NSProgressIndicator()
     private let timerLabel = NSTextField.label("00:00.00", font: .monospacedDigitSystemFont(ofSize: 42, weight: .bold), color: .labelColor)
-    private let startButton = NSButton(title: "Start Transcription", target: nil, action: nil)
+    private let startButton = NSButton(title: "Start", target: nil, action: nil)
 
     override init(frame frameRect: NSRect) {
         super.init(frame: frameRect)
@@ -1095,48 +1494,17 @@ private final class TranscriptionProgressView: NSView {
         fatalError("init(coder:) has not been implemented")
     }
 
-    func update(state: VoxTranscriptionState, selectedFile: VoxFileItem?) {
-        let progress: Double
-        switch state {
-        case .transcribing(let value, _):
-            progress = value
-        case .downloadingModel(let value):
-            progress = value
-        case .extractingAudio:
-            progress = 0.08
-        case .loadingModel:
-            progress = 0.12
-        case .preparingAudio:
-            progress = 0.18
-        case .diarizing(let value):
-            progress = value
-        case .refining:
-            progress = 0.96
-        case .completed:
-            progress = 1
-        case .error:
-            progress = 0
-        case .idle, .recording:
-            progress = 0
-        }
+    func update(display: ProgressDisplayModel) {
+        let progress = min(1, max(0, display.progress))
+        startLabel.stringValue = display.leftLabel
+        percentLabel.stringValue = display.centerLabel
+        endLabel.stringValue = display.rightLabel
+        progressIndicator.doubleValue = progress
+        timerLabel.stringValue = Self.elapsedString(display.elapsed)
 
-        progressIndicator.doubleValue = min(1, max(0, progress))
-        percentLabel.stringValue = "\(Int(progressIndicator.doubleValue * 100))%"
-
-        if let duration = selectedFile?.duration {
-            endLabel.stringValue = duration
-        } else {
-            endLabel.stringValue = "--:--"
-        }
-        startLabel.stringValue = progress > 0 && selectedFile?.duration != nil
-            ? VoxTranscriptionState.formatDuration(progress * durationSeconds(selectedFile?.duration))
-            : "0:00"
-        timerLabel.stringValue = Self.timerString(progress: progress, duration: selectedFile?.duration)
-
-        let canStart = selectedFile != nil && !state.isBusy
-        startButton.isEnabled = canStart
-        startButton.alphaValue = canStart ? 1 : 0.5
-        startButton.title = state.isBusy ? "Transcribing" : "Start Transcription"
+        startButton.isEnabled = display.buttonEnabled
+        startButton.alphaValue = display.buttonEnabled ? 1 : 0.5
+        startButton.title = display.buttonTitle
     }
 
     private func setup() {
@@ -1207,37 +1575,13 @@ private final class TranscriptionProgressView: NSView {
         onStart?()
     }
 
-    private func durationSeconds(_ duration: String?) -> Double {
-        guard let duration else { return 0 }
-        let parts = duration.split(separator: ":").compactMap { Double($0) }
-        if parts.count == 3 {
-            return parts[0] * 3600 + parts[1] * 60 + parts[2]
-        }
-        if parts.count == 2 {
-            return parts[0] * 60 + parts[1]
-        }
-        return 0
-    }
-
-    private static func timerString(progress: Double, duration: String?) -> String {
-        let total = max(0, progress) * Self.durationSecondsStatic(duration)
-        let whole = Int(total)
-        let hundredths = Int((total - Double(whole)) * 100)
+    private static func elapsedString(_ duration: TimeInterval) -> String {
+        let safeDuration = max(0, duration)
+        let whole = Int(safeDuration)
+        let hundredths = Int((safeDuration - Double(whole)) * 100)
         let minutes = whole / 60
         let seconds = whole % 60
         return String(format: "%02d:%02d.%02d", minutes, seconds, hundredths)
-    }
-
-    private static func durationSecondsStatic(_ duration: String?) -> Double {
-        guard let duration else { return 0 }
-        let parts = duration.split(separator: ":").compactMap { Double($0) }
-        if parts.count == 3 {
-            return parts[0] * 3600 + parts[1] * 60 + parts[2]
-        }
-        if parts.count == 2 {
-            return parts[0] * 60 + parts[1]
-        }
-        return 0
     }
 }
 

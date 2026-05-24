@@ -109,6 +109,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     }
 
     @objc private func settingsChanged() {
+        mainWindow?.refreshSettings()
         menuBarSetup?.refresh()
     }
 

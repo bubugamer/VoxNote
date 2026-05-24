@@ -1,6 +1,6 @@
 # VoxNote
 
-[中文](README.md)
+[中文](README.md) · [Changelog](CHANGELOG.en.md)
 
 VoxNote is a local speech-to-text app for macOS. It transcribes audio, video, and live recordings into clean text — useful for meeting notes, interview writeups, lecture notes, podcast transcripts, and video subtitle drafts.
 
@@ -23,8 +23,9 @@ VoxNote is a local speech-to-text app for macOS. It transcribes audio, video, an
 
 1. Select a folder.
 2. Pick an audio or video file from the left sidebar.
-3. Click **Start Transcription**.
-4. Copy or export the result once transcription completes.
+3. Click **Start**.
+4. Copy or export the result once local transcription completes.
+5. To run LLM correction, click **Refine**. When correction finishes, the transcript text is replaced with the refined version.
 
 You can also click the record button in the bottom-left corner to transcribe live microphone input.
 
@@ -41,7 +42,7 @@ Requires macOS 14 or later. An Apple Silicon Mac is recommended.
 **Download the DMG (recommended):**
 
 1. Open [VoxNote Releases](https://github.com/bubugamer/VoxNote/releases/latest).
-2. Download the latest `VoxNote-0.1.2-macOS.dmg`.
+2. Download the latest `VoxNote-0.1.3-macOS.dmg`.
 3. Open the DMG and drag `VoxNote.app` to `Applications`.
 4. Launch VoxNote.
 
@@ -64,7 +65,7 @@ The source repository does not include model files. When building from source, V
 
 The core transcription pipeline runs entirely on-device. File transcription requires no microphone permission; only live recording asks for microphone access.
 
-LLM post-correction is an optional feature and is disabled by default. Text is only sent to the external endpoint you configure after you explicitly enable it.
+LLM post-correction is an optional feature and is disabled by default. Text is only sent to the external endpoint you configure after you explicitly enable it and click **Refine**.
 
 ## License
 
