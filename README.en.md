@@ -42,7 +42,7 @@ Requires macOS 14 or later. An Apple Silicon Mac is recommended.
 **Download the DMG (recommended):**
 
 1. Open [VoxNote Releases](https://github.com/bubugamer/VoxNote/releases/latest).
-2. Download the latest `VoxNote-0.1.3-macOS.dmg`.
+2. Download the latest `VoxNote-0.1.4-macOS.dmg`.
 3. Open the DMG and drag `VoxNote.app` to `Applications`.
 4. Launch VoxNote.
 

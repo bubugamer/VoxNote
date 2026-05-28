@@ -99,7 +99,7 @@ private struct Options {
 
     static func parse(_ args: ArraySlice<String>) throws -> Options {
         var outputPath = "Resources/BundledModels"
-        var whisperVariant = "openai_whisper-large-v3-v20240930_626MB"
+        var whisperVariant = "openai_whisper-small"
         var skipWhisper = false
         var skipSpeaker = false
 
@@ -139,7 +139,7 @@ private struct Options {
 
         Options:
           --output PATH       Destination directory. Default: Resources/BundledModels
-          --whisper VARIANT   WhisperKit model variant. Default: openai_whisper-large-v3-v20240930_626MB
+          --whisper VARIANT   WhisperKit model variant. Default: openai_whisper-small
           --skip-whisper      Do not prepare Whisper model files
           --skip-speaker      Do not prepare SpeakerKit model files
         """)

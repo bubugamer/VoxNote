@@ -2,6 +2,27 @@
 
 [中文](CHANGELOG.md) · [Back to README](README.en.md)
 
+## 0.1.4 - 2026-05-28
+
+### Real-time Recording
+
+- Recording now supports pause / resume; after stopping you can save the audio (M4A) or discard it.
+- Recording can start immediately even before the model finishes loading; the model attaches automatically once it is ready in the background.
+- The speech model is preloaded at app launch, so recording and transcription respond faster.
+- Silent segments are skipped during transcription to avoid meaningless output.
+- Microphone permission requests now time out after 30 seconds to avoid hanging when the prompt is unresponsive.
+
+### Default Model Change
+
+- The default speech model changed from large-v3 (626MB) to small (~467MB); small is now the recommended model. Existing users are migrated automatically.
+
+### UI Fixes
+
+- Fixed the copy button not showing the "Copied" toast (the toast was previously hidden behind other panels).
+- Fixed the settings gear appearing selected / highlighted on launch.
+- Top-right icons no longer disappear during recording; they stay visible but disabled.
+- Discarding a recording in the live recording view now correctly clears the transcript when returning to the main view.
+
 ## 0.1.3 - 2026-05-24
 
 ### Refine and Progress Feedback

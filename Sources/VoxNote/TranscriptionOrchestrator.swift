@@ -13,24 +13,46 @@ final class TranscriptionOrchestrator: @unchecked Sendable {
     private let whisperManager = WhisperKitManager()
     private let speakerManager = SpeakerKitManager()
     private let videoAudioExtractor = VideoAudioExtractor()
-    private let fileRecorder = FileAudioRecorder()
+    private let streamingTranscriber = StreamingTranscriber()
     private let stateLock = NSLock()
 
     private var currentTask: Task<Void, Never>?
-    private var recordingTimerTask: Task<Void, Never>?
     private var currentState: VoxTranscriptionState = .idle
     private(set) var currentSourceName = "Transcription"
     private(set) var currentSourceURL: URL?
     private var recordingDirectoryURL: URL?
+    private var pendingRecording: PendingRecording?
+    private var activeOperationID: UUID?
 
-    private init() {}
+    var hasUnsavedRecording: Bool {
+        stateLock.lock()
+        defer { stateLock.unlock() }
+        return pendingRecording != nil
+    }
+
+    private init() {
+        streamingTranscriber.onStateChange = { [weak self] state in
+            self?.emit(.recording(
+                confirmedText: state.confirmedText,
+                pendingText: state.pendingText,
+                duration: state.duration,
+                isPaused: state.isPaused,
+                modelState: state.modelState
+            ))
+        }
+        streamingTranscriber.onError = { [weak self] error in
+            self?.logger.error("Recording stream failed: \(error.localizedDescription, privacy: .public)")
+            self?.emit(.error(error.localizedDescription))
+        }
+    }
 
     func transcribe(fileURL: URL) {
         cancel()
+        let operationID = beginOperation()
         currentSourceName = fileURL.deletingPathExtension().lastPathComponent
         currentSourceURL = fileURL
         currentTask = Task { [weak self] in
-            await self?.runFileTranscription(fileURL: fileURL)
+            await self?.runFileTranscription(fileURL: fileURL, operationID: operationID)
         }
     }
 
@@ -38,40 +60,86 @@ final class TranscriptionOrchestrator: @unchecked Sendable {
         recordingDirectoryURL = url
     }
 
-    func startRecording() {
-        guard !fileRecorder.isRecording else { return }
+    @discardableResult
+    func startRecording() -> Bool {
+        guard !streamingTranscriber.isRecording else { return false }
+        guard AppModelManager.shared.canStartRealtimeRecording else { return false }
         cancel()
+        AppModelManager.shared.cancelAutoUnload()
         currentSourceName = Self.defaultRecordingBaseName()
         currentSourceURL = nil
+        setPendingRecording(nil)
+        let operationID = beginOperation()
         currentTask = Task { [weak self] in
-            await self?.runStartRecording()
+            await self?.runStartRecording(operationID: operationID)
+        }
+        return true
+    }
+
+    func pauseRecording() {
+        streamingTranscriber.pauseRecording()
+    }
+
+    func resumeRecording() {
+        do {
+            try streamingTranscriber.resumeRecording()
+        } catch {
+            logger.error("Recording failed to resume: \(error.localizedDescription, privacy: .public)")
+            emit(.error(error.localizedDescription))
         }
     }
 
     func stopRecording() {
-        // Cancel any in-progress start task (covers the mic-permission phase
-        // where fileRecorder.isRecording is still false)
+        clearActiveOperation()
         currentTask?.cancel()
         currentTask = nil
-        guard fileRecorder.isRecording else { return }
+        guard streamingTranscriber.isRecording else {
+            emit(.idle)
+            return
+        }
         currentTask = Task { [weak self] in
             await self?.runStopRecording()
         }
     }
 
-    func cancel() {
-        currentTask?.cancel()
-        currentTask = nil
-        recordingTimerTask?.cancel()
-        recordingTimerTask = nil
-        whisperManager.cancel()
-        speakerManager.cancel()
-        if fileRecorder.isRecording {
-            _ = fileRecorder.stop()
+    func savePendingRecording(to directory: URL) throws -> URL {
+        guard let recording = lockedPendingRecording() else {
+            throw AppError.exportFailed("There is no unsaved recording audio.")
+        }
+
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        let outputURL = uniqueFileURL(in: directory, baseName: recording.baseName, extension: "m4a")
+        do {
+            try RecordingAudioWriter.writeM4A(samples: recording.audioArray, to: outputURL)
+            currentSourceURL = outputURL
+            currentSourceName = outputURL.deletingPathExtension().lastPathComponent
+            setPendingRecording(nil)
+            return outputURL
+        } catch {
+            try? FileManager.default.removeItem(at: outputURL)
+            throw error
         }
     }
 
-    private func runFileTranscription(fileURL: URL) async {
+    func discardPendingRecording() {
+        setPendingRecording(nil)
+    }
+
+    func cancel() {
+        clearActiveOperation()
+        currentTask?.cancel()
+        currentTask = nil
+        whisperManager.cancel()
+        speakerManager.cancel()
+        if streamingTranscriber.isRecording {
+            Task {
+                _ = await streamingTranscriber.stopRecording()
+            }
+        }
+        setPendingRecording(nil)
+    }
+
+    private func runFileTranscription(fileURL: URL, operationID: UUID) async {
         var tempAudioURL: URL?
         do {
             guard VideoAudioExtractor.isSupportedFile(fileURL) else {
@@ -80,7 +148,7 @@ final class TranscriptionOrchestrator: @unchecked Sendable {
 
             let audioURL: URL
             if VideoAudioExtractor.isVideoFile(fileURL) {
-                emit(.extractingAudio)
+                emit(.extractingAudio, operationID: operationID)
                 let extracted = try await videoAudioExtractor.extractAudio(from: fileURL)
                 tempAudioURL = extracted
                 audioURL = extracted
@@ -89,25 +157,30 @@ final class TranscriptionOrchestrator: @unchecked Sendable {
             }
 
             try Task.checkCancellation()
-            emit(.preparingAudio)
+            emit(.preparingAudio, operationID: operationID)
             let audioArray = try AudioProcessor.loadAudioAsFloatArray(fromPath: audioURL.path)
 
-            try await ensureWhisperReady()
+            try await ensureWhisperReady(operationID: operationID)
             try Task.checkCancellation()
+            try checkCurrentOperation(operationID)
 
             let finalText = try await transcribeAndPostProcess(
                 audioArray: audioArray,
                 recordingSegments: nil,
-                fallbackText: nil
+                fallbackText: nil,
+                operationID: operationID
             )
 
-            emit(.completed(finalText))
+            emit(.completed(finalText), operationID: operationID)
+            clearActiveOperation(matching: operationID)
             AppModelManager.shared.scheduleAutoUnload(after: 600)
         } catch is CancellationError {
-            emit(.idle)
+            emit(.idle, operationID: operationID)
+            clearActiveOperation(matching: operationID)
         } catch {
             logger.error("File transcription failed: \(error.localizedDescription, privacy: .public)")
-            emit(.error(error.localizedDescription))
+            emit(.error(error.localizedDescription), operationID: operationID)
+            clearActiveOperation(matching: operationID)
         }
 
         if let tempAudioURL {
@@ -115,72 +188,92 @@ final class TranscriptionOrchestrator: @unchecked Sendable {
         }
     }
 
-    private func runStartRecording() async {
+    private func runStartRecording(operationID: UUID) async {
         do {
             guard let directory = recordingDirectoryURL else {
                 throw AppError.exportFailed("Choose a folder before recording.")
             }
+            guard AppModelManager.shared.canStartRealtimeRecording else {
+                throw AppError.noWhisperKit
+            }
 
             try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+            emit(.preparingAudio, operationID: operationID)
             try await PermissionManager.shared.ensureMicrophoneAccess()
             try Task.checkCancellation()
+            try checkCurrentOperation(operationID)
 
-            let baseName = Self.defaultRecordingBaseName()
-            let outputURL = uniqueFileURL(in: directory, baseName: baseName, extension: "m4a")
-            try fileRecorder.start(url: outputURL)
+            try await streamingTranscriber.startRecording(language: LanguageManager.shared.whisperLanguage)
+            streamingTranscriber.updateModelState(.ready)
 
-            currentSourceURL = outputURL
-            currentSourceName = outputURL.deletingPathExtension().lastPathComponent
-            startRecordingTimer(startedAt: Date())
-            emit(.recording(confirmedText: "", pendingText: "", duration: 0))
+            try Task.checkCancellation()
+            try checkCurrentOperation(operationID)
+            clearActiveOperation(matching: operationID)
         } catch is CancellationError {
-            emit(.idle)
+            emit(.idle, operationID: operationID)
+            clearActiveOperation(matching: operationID)
         } catch {
             logger.error("Recording failed to start: \(error.localizedDescription, privacy: .public)")
-            emit(.error(error.localizedDescription))
+            emit(.error(error.localizedDescription), operationID: operationID)
+            clearActiveOperation(matching: operationID)
         }
     }
 
     private func runStopRecording() async {
-        recordingTimerTask?.cancel()
-        recordingTimerTask = nil
-
-        // If cancel() was called concurrently it already stopped the recorder;
-        // bail out rather than emitting a spurious error for a saved file.
         guard !Task.isCancelled else { return }
 
-        guard let recordingURL = fileRecorder.stop() else {
-            emit(.error("Recording could not be saved."))
-            return
+        let result = await streamingTranscriber.stopRecording()
+        let finalText = result.finalText.trimmingCharacters(in: .whitespacesAndNewlines)
+
+        if !result.audioArray.isEmpty {
+            setPendingRecording(PendingRecording(
+                baseName: currentSourceName,
+                audioArray: result.audioArray
+            ))
+        } else {
+            setPendingRecording(nil)
         }
 
-        currentSourceURL = recordingURL
-        currentSourceName = recordingURL.deletingPathExtension().lastPathComponent
-        await runFileTranscription(fileURL: recordingURL)
+        emit(.completed(finalText))
+        AppModelManager.shared.scheduleAutoUnload(after: 600)
     }
 
-    private func ensureWhisperReady() async throws {
+    private func ensureWhisperReady(operationID: UUID, forRecording: Bool = false) async throws {
         try await AppModelManager.shared.ensureWhisperKitReady { [weak self] state in
-            switch state {
-            case .downloading(let progress):
-                self?.emit(.downloadingModel(progress: progress))
-            case .loading:
-                self?.emit(.loadingModel)
-            case .ready:
-                break
-            case .error(let message):
-                self?.emit(.error(message))
-            case .notDownloaded, .downloaded:
-                break
+            guard self?.isCurrentOperation(operationID) == true else { return }
+            if forRecording {
+                self?.streamingTranscriber.updateModelState(state)
+            } else {
+                switch state {
+                case .downloading(let progress):
+                    self?.emit(.downloadingModel(progress: progress), operationID: operationID)
+                case .loading:
+                    self?.emit(.loadingModel, operationID: operationID)
+                case .ready:
+                    break
+                case .error(let message):
+                    self?.emit(.error(message), operationID: operationID)
+                case .notDownloaded, .downloaded:
+                    break
+                }
             }
+        }
+        try checkCurrentOperation(operationID)
+        if forRecording {
+            streamingTranscriber.updateModelState(.ready)
         }
     }
 
     private func transcribeAndPostProcess(
         audioArray: [Float],
         recordingSegments: [TranscriptionSegment]?,
-        fallbackText: String?
+        fallbackText: String?,
+        operationID: UUID
     ) async throws -> String {
+        guard AudioSignal.containsNonSilentSamples(audioArray) else {
+            return ""
+        }
+
         let speakerEnabled = UserDefaults.standard.bool(forKey: "speakerDiarizationEnabled")
         let diarizationTask: Task<DiarizationResult?, Never>? = speakerEnabled ? Task {
             do {
@@ -207,11 +300,11 @@ final class TranscriptionOrchestrator: @unchecked Sendable {
                 audioArray: audioArray,
                 language: LanguageManager.shared.whisperLanguage,
                 onProgress: { [weak self] progress, partialText in
-                    self?.emit(.transcribing(progress: progress, partialText: partialText))
+                    self?.emit(.transcribing(progress: progress, partialText: partialText), operationID: operationID)
                 },
                 onSegment: { [weak self] segments in
                     let text = segments.map(\.text).joined(separator: "\n")
-                    self?.emit(.transcribing(progress: 0.98, partialText: text))
+                    self?.emit(.transcribing(progress: 0.98, partialText: text), operationID: operationID)
                 }
             )
         }
@@ -222,14 +315,14 @@ final class TranscriptionOrchestrator: @unchecked Sendable {
             .trimmingCharacters(in: .whitespacesAndNewlines)
 
         if let diarizationTask {
-            emit(.diarizing(progress: 0))
+            emit(.diarizing(progress: 0), operationID: operationID)
             if let diarization = await diarizationTask.value {
                 finalText = speakerManager.combinedText(
                     diarization: diarization,
                     transcription: transcriptionResults
                 )
             }
-            emit(.diarizing(progress: 1))
+            emit(.diarizing(progress: 1), operationID: operationID)
         }
 
         return finalText
@@ -249,33 +342,58 @@ final class TranscriptionOrchestrator: @unchecked Sendable {
         return candidate
     }
 
-    private func startRecordingTimer(startedAt: Date) {
-        recordingTimerTask?.cancel()
-        recordingTimerTask = Task { [weak self] in
-            do {
-                while true {
-                    try await Task.sleep(nanoseconds: 200_000_000)
-                    guard let self, self.fileRecorder.isRecording else { break }
-                    self.emit(.recording(
-                        confirmedText: "",
-                        pendingText: "",
-                        duration: Date().timeIntervalSince(startedAt)
-                    ))
-                }
-            } catch {
-                // Task was cancelled — exit without emitting stale state
-            }
-        }
-    }
-
     private static func defaultRecordingBaseName() -> String {
         let formatter = DateFormatter()
         formatter.dateFormat = "yyyy-MM-dd HH.mm.ss"
         return "Recording \(formatter.string(from: Date()))"
     }
 
-    private func emit(_ state: VoxTranscriptionState) {
+    private func lockedPendingRecording() -> PendingRecording? {
         stateLock.lock()
+        defer { stateLock.unlock() }
+        return pendingRecording
+    }
+
+    private func setPendingRecording(_ recording: PendingRecording?) {
+        stateLock.lock()
+        pendingRecording = recording
+        stateLock.unlock()
+    }
+
+    private func beginOperation() -> UUID {
+        let operationID = UUID()
+        stateLock.lock()
+        activeOperationID = operationID
+        stateLock.unlock()
+        return operationID
+    }
+
+    private func isCurrentOperation(_ operationID: UUID) -> Bool {
+        stateLock.lock()
+        defer { stateLock.unlock() }
+        return activeOperationID == operationID
+    }
+
+    private func checkCurrentOperation(_ operationID: UUID) throws {
+        if !isCurrentOperation(operationID) {
+            throw CancellationError()
+        }
+    }
+
+    private func clearActiveOperation(matching operationID: UUID? = nil) {
+        stateLock.lock()
+        if operationID == nil || activeOperationID == operationID {
+            activeOperationID = nil
+        }
+        stateLock.unlock()
+    }
+
+    private func emit(_ state: VoxTranscriptionState, operationID: UUID? = nil) {
+        stateLock.lock()
+        if let operationID, activeOperationID != operationID {
+            stateLock.unlock()
+            return
+        }
         currentState = state
         stateLock.unlock()
         DispatchQueue.main.async { [weak self] in
@@ -284,49 +402,59 @@ final class TranscriptionOrchestrator: @unchecked Sendable {
     }
 }
 
-private final class FileAudioRecorder: NSObject, @unchecked Sendable {
-    private let lock = NSLock()
-    private var recorder: AVAudioRecorder?
-    private var recordingURL: URL?
+private struct PendingRecording {
+    let baseName: String
+    let audioArray: [Float]
+}
 
-    var isRecording: Bool {
-        lock.lock()
-        defer { lock.unlock() }
-        return recorder?.isRecording == true
-    }
+private enum RecordingAudioWriter {
+    static func writeM4A(samples: [Float], to url: URL) throws {
+        guard !samples.isEmpty else {
+            throw AppError.exportFailed("No recorded audio is available to save.")
+        }
+        guard let inputFormat = AVAudioFormat(
+            commonFormat: .pcmFormatFloat32,
+            sampleRate: Double(WhisperKit.sampleRate),
+            channels: 1,
+            interleaved: false
+        ) else {
+            throw AppError.exportFailed("Could not prepare the recorded audio for saving.")
+        }
 
-    func start(url: URL) throws {
-        let settings: [String: Any] = [
-            AVFormatIDKey: Int(kAudioFormatMPEG4AAC),
-            AVSampleRateKey: 44_100,
+        let outputSettings: [String: Any] = [
+            AVFormatIDKey: kAudioFormatMPEG4AAC,
+            AVSampleRateKey: WhisperKit.sampleRate,
             AVNumberOfChannelsKey: 1,
             AVEncoderAudioQualityKey: AVAudioQuality.high.rawValue
         ]
 
-        let newRecorder = try AVAudioRecorder(url: url, settings: settings)
-        newRecorder.isMeteringEnabled = true
-        newRecorder.prepareToRecord()
-
-        // Hold the lock while calling record() so that recorder is visible to
-        // concurrent isRecording / stop() calls the instant recording goes live.
-        lock.lock()
-        defer { lock.unlock() }
-        guard newRecorder.record() else {
-            throw AppError.exportFailed("Recording could not start.")
+        let file = try AVAudioFile(
+            forWriting: url,
+            settings: outputSettings,
+            commonFormat: .pcmFormatFloat32,
+            interleaved: false
+        )
+        let chunkSize = 1_048_576
+        var offset = 0
+        while offset < samples.count {
+            let frameCount = min(chunkSize, samples.count - offset)
+            guard let buffer = AVAudioPCMBuffer(
+                pcmFormat: inputFormat,
+                frameCapacity: AVAudioFrameCount(frameCount)
+            ) else {
+                throw AppError.exportFailed("Could not prepare the recorded audio for saving.")
+            }
+            buffer.frameLength = AVAudioFrameCount(frameCount)
+            guard let channel = buffer.floatChannelData?[0] else {
+                throw AppError.exportFailed("Could not prepare the recorded audio for saving.")
+            }
+            samples.withUnsafeBufferPointer { source in
+                if let baseAddress = source.baseAddress {
+                    channel.update(from: baseAddress.advanced(by: offset), count: frameCount)
+                }
+            }
+            try file.write(from: buffer)
+            offset += frameCount
         }
-        recorder = newRecorder
-        recordingURL = url
-    }
-
-    func stop() -> URL? {
-        lock.lock()
-        let localRecorder = recorder
-        let url = recordingURL
-        recorder = nil
-        recordingURL = nil
-        lock.unlock()
-
-        localRecorder?.stop()
-        return url
     }
 }

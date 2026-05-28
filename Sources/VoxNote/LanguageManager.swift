@@ -19,6 +19,7 @@ final class LanguageManager {
             key: "auto",
             "hasLaunchedBefore": false,
             "selectedModel": AppModelManager.defaultModelVariant,
+            "didMigrateDefaultModelToSmall": false,
             "speakerDiarizationEnabled": false,
             "llmEnabled": false,
             "llmBaseURL": "",

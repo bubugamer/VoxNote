@@ -8,7 +8,7 @@ enum VoxTranscriptionState: Equatable {
     case loadingModel
     case preparingAudio
     case transcribing(progress: Double, partialText: String)
-    case recording(confirmedText: String, pendingText: String, duration: TimeInterval)
+    case recording(confirmedText: String, pendingText: String, duration: TimeInterval, isPaused: Bool, modelState: AppModelManagerState)
     case diarizing(progress: Double)
     case refining
     case completed(String)
@@ -38,8 +38,20 @@ enum VoxTranscriptionState: Equatable {
             return "Preparing audio..."
         case .transcribing(let progress, _):
             return "Transcribing... \(Int(progress * 100))%"
-        case .recording(_, _, let duration):
-            return "Recording... \(Self.formatDuration(duration))"
+        case .recording(_, _, let duration, let isPaused, let modelState):
+            let prefix = isPaused ? "Paused" : "Recording"
+            let suffix: String
+            switch modelState {
+            case .ready:
+                suffix = ""
+            case .downloading(let progress):
+                suffix = " · Downloading model \(Int(progress * 100))%"
+            case .loading, .downloaded, .notDownloaded:
+                suffix = " · Loading model..."
+            case .error:
+                suffix = " · Model unavailable"
+            }
+            return "\(prefix)... \(Self.formatDuration(duration))\(suffix)"
         case .diarizing(let progress):
             return "Identifying speakers... \(Int(progress * 100))%"
         case .refining:
@@ -102,6 +114,8 @@ struct StreamingState: Equatable {
     var pendingText: String
     var duration: TimeInterval
     var isRecording: Bool
+    var isPaused: Bool
+    var modelState: AppModelManagerState
 }
 
 struct StreamingResult {
@@ -117,6 +131,11 @@ enum AppError: LocalizedError {
     case exportSessionUnavailable
     case exportFailed(String)
     case microphoneDenied
+    case microphonePermissionTimedOut
+    case microphoneUnavailable
+    case microphoneInputFormatUnavailable
+    case recordingStartFailed
+    case recordingStoppedUnexpectedly
     case llmNotConfigured
     case invalidLLMResponse
     case llmTimedOut
@@ -133,6 +152,16 @@ enum AppError: LocalizedError {
             return message
         case .microphoneDenied:
             return "Microphone access is required for real-time transcription. Please enable VoxNote in System Settings > Privacy & Security > Microphone."
+        case .microphonePermissionTimedOut:
+            return "Microphone permission did not complete. Please enable VoxNote in System Settings > Privacy & Security > Microphone, then try recording again."
+        case .microphoneUnavailable:
+            return "No microphone input device is available. Please connect or select a microphone, then try again."
+        case .microphoneInputFormatUnavailable:
+            return "VoxNote could not read a usable microphone input format. Please check your microphone device and try again."
+        case .recordingStartFailed:
+            return "Recording could not start. Please check microphone input and try again."
+        case .recordingStoppedUnexpectedly:
+            return "Recording stopped unexpectedly. Please check microphone input and try again."
         case .llmNotConfigured:
             return "LLM refinement is enabled, but the API settings are incomplete."
         case .invalidLLMResponse:

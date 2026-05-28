@@ -38,8 +38,8 @@ final class TranscriptionView: NSView {
             if !partialText.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
                 setPlainText(partialText)
             }
-        case .recording(let confirmedText, let pendingText, let duration):
-            statusLabel.stringValue = "Recording... \(VoxTranscriptionState.formatDuration(duration))"
+        case .recording(let confirmedText, let pendingText, let duration, let isPaused, _):
+            statusLabel.stringValue = "\(isPaused ? "Paused" : "Recording")... \(VoxTranscriptionState.formatDuration(duration))"
             statusLabel.textColor = .labelColor
             hideProgressIndicatorOnly()
             setRecordingText(confirmed: confirmedText, pending: pendingText)

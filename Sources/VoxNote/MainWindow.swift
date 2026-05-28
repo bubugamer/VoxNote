@@ -27,6 +27,7 @@ final class MainWindow: NSWindow, NSWindowDelegate {
     private let topBar = NSView()
     private let topModelStatusLabel = NSTextField.label("", font: .systemFont(ofSize: 12, weight: .medium), color: .secondaryLabelColor)
     private let actionGroup = NSStackView()
+    private let copyToastLabel = NSTextField.label("Copied", font: .systemFont(ofSize: 12, weight: .semibold), color: .white)
     private let mainContainer = NSView()
     private let sidebarView = FileSidebarView()
     private let transcriptView = TranscriptPanelView()
@@ -36,6 +37,7 @@ final class MainWindow: NSWindow, NSWindowDelegate {
     private var selectedFolderURL: URL?
     private var files: [VoxFileItem] = []
     private var selectedFile: VoxFileItem?
+    private var selectedFileBeforeRecording: VoxFileItem?
     private var latestState: VoxTranscriptionState = .idle
     private var refineTask: Task<Void, Never>?
     private var activeRefineID: UUID?
@@ -45,6 +47,8 @@ final class MainWindow: NSWindow, NSWindowDelegate {
     private var elapsedBeforeCurrentRun: TimeInterval = 0
     private var elapsedRunStartedAt: Date?
     private var elapsedTimerTask: Task<Void, Never>?
+    private var copyToastGeneration = 0
+    private var isRecordingInProgress = false
 
     init() {
         let rect = NSRect(x: 0, y: 0, width: 1320, height: 820)
@@ -57,6 +61,8 @@ final class MainWindow: NSWindow, NSWindowDelegate {
         title = "VoxNote"
         titleVisibility = .hidden
         titlebarAppearsTransparent = true
+        isRestorable = false
+        collectionBehavior.insert(.moveToActiveSpace)
         minSize = NSSize(width: 1120, height: 700)
         delegate = self
         isReleasedWhenClosed = false
@@ -70,6 +76,7 @@ final class MainWindow: NSWindow, NSWindowDelegate {
 
     func show() {
         makeKeyAndOrderFront(nil)
+        orderFrontRegardless()
         NSApp.activate(ignoringOtherApps: true)
     }
 
@@ -95,9 +102,10 @@ final class MainWindow: NSWindow, NSWindowDelegate {
         }
     }
 
-    func copyAll() {
-        guard !latestState.isBusy else { return }
-        transcriptView.copyAll()
+    @discardableResult
+    func copyAll() -> Bool {
+        guard !latestState.isBusy else { return false }
+        return transcriptView.copyAll()
     }
 
     func exportTranscription() {
@@ -131,9 +139,27 @@ final class MainWindow: NSWindow, NSWindowDelegate {
         if case .completed = state {
             stopElapsedTimer()
             refreshFolderAfterCompletion()
+            if !recordingView.isHidden {
+                showStoppedRecordingMode()
+            }
         }
-        if case .error = state {
+        if case .idle = state, !recordingView.isHidden {
+            restoreSelectionAfterCancelledRecording()
+            showMainMode()
+            refreshProgressView()
+        }
+        if case .error(let message) = state {
             stopElapsedTimer()
+            if !recordingView.isHidden {
+                if TranscriptionOrchestrator.shared.hasUnsavedRecording {
+                    showStoppedRecordingMode()
+                } else {
+                    restoreSelectionAfterCancelledRecording()
+                    showMainMode()
+                    refreshProgressView()
+                    showAlert(title: "Recording Failed", message: message)
+                }
+            }
         }
 
         updateActionState()
@@ -149,6 +175,7 @@ final class MainWindow: NSWindow, NSWindowDelegate {
     func refreshModelStatus() {
         let manager = AppModelManager.shared
         topModelStatusLabel.stringValue = "Model: \(manager.currentModelInfo.displayName) - \(manager.whisperModelState.displayText)"
+        updateActionState()
     }
 
     func refreshSettings() {
@@ -217,6 +244,14 @@ final class MainWindow: NSWindow, NSWindowDelegate {
         actionGroup.layer?.backgroundColor = NSColor.voxControlBackground.cgColor
         topBar.addSubview(actionGroup)
 
+        copyToastLabel.alignment = .center
+        copyToastLabel.isHidden = true
+        copyToastLabel.alphaValue = 0
+        copyToastLabel.wantsLayer = true
+        copyToastLabel.layer?.cornerRadius = 12
+        copyToastLabel.layer?.backgroundColor = NSColor.black.withAlphaComponent(0.78).cgColor
+        contentView?.addSubview(copyToastLabel)
+
         topModelStatusLabel.alignment = .right
         topModelStatusLabel.lineBreakMode = .byTruncatingTail
         topBar.addSubview(topModelStatusLabel)
@@ -233,6 +268,11 @@ final class MainWindow: NSWindow, NSWindowDelegate {
             actionGroup.trailingAnchor.constraint(equalTo: topBar.trailingAnchor, constant: -18),
             actionGroup.centerYAnchor.constraint(equalTo: topBar.centerYAnchor),
             actionGroup.heightAnchor.constraint(equalToConstant: 42),
+
+            copyToastLabel.trailingAnchor.constraint(equalTo: actionGroup.trailingAnchor),
+            copyToastLabel.topAnchor.constraint(equalTo: actionGroup.bottomAnchor, constant: 7),
+            copyToastLabel.widthAnchor.constraint(equalToConstant: 76),
+            copyToastLabel.heightAnchor.constraint(equalToConstant: 26),
 
             topModelStatusLabel.trailingAnchor.constraint(equalTo: actionGroup.leadingAnchor, constant: -12),
             topModelStatusLabel.centerYAnchor.constraint(equalTo: topBar.centerYAnchor),
@@ -295,8 +335,17 @@ final class MainWindow: NSWindow, NSWindowDelegate {
         progressView.onStart = { [weak self] in
             self?.handleProgressAction()
         }
-        recordingView.onDone = { [weak self] in
-            self?.finishRecording()
+        recordingView.onPauseResume = { [weak self] in
+            self?.toggleRecordingPause()
+        }
+        recordingView.onStop = { [weak self] in
+            self?.stopRecordingFlow()
+        }
+        recordingView.onSave = { [weak self] in
+            self?.saveRecordingAudio()
+        }
+        recordingView.onDiscard = { [weak self] in
+            self?.discardRecordingAudio()
         }
     }
 
@@ -340,6 +389,7 @@ final class MainWindow: NSWindow, NSWindowDelegate {
         cancelManualRefine()
         resetElapsedTimer()
         selectedFolderURL = url
+        selectedFileBeforeRecording = nil
         UserDefaults.standard.set(url.path, forKey: "selectedFolderPath")
 
         files = Self.supportedFiles(in: url)
@@ -368,6 +418,11 @@ final class MainWindow: NSWindow, NSWindowDelegate {
     }
 
     private func handleProgressAction() {
+        if case .completed = latestState, TranscriptionOrchestrator.shared.hasUnsavedRecording {
+            saveRecordingAudio()
+            return
+        }
+
         switch currentRefineState() {
         case .ready:
             startManualRefine()
@@ -399,6 +454,10 @@ final class MainWindow: NSWindow, NSWindowDelegate {
 
     private func startRecordingFlow() {
         guard !latestState.isBusy, !isRefining else { return }
+        guard AppModelManager.shared.canStartRealtimeRecording else {
+            refreshModelStatus()
+            return
+        }
         guard selectedFolderURL != nil else {
             chooseFolder(startRecordingAfterSelection: true)
             return
@@ -407,30 +466,89 @@ final class MainWindow: NSWindow, NSWindowDelegate {
         cancelManualRefine()
         hasRefinedTranscript = false
         refineProgress = nil
+        selectedFileBeforeRecording = selectedFile
+        selectedFile = nil
+        if let folder = selectedFolderURL {
+            sidebarView.setFolder(folder, files: files, selected: nil)
+        }
         resetElapsedTimer()
         showRecordingMode()
         let folderName = selectedFolderURL?.lastPathComponent ?? "Recordings"
         recordingView.prepare(folderName: folderName)
         TranscriptionOrchestrator.shared.setRecordingDirectory(selectedFolderURL)
-        TranscriptionOrchestrator.shared.startRecording()
+        if !TranscriptionOrchestrator.shared.startRecording() {
+            restoreSelectionAfterCancelledRecording()
+            showMainMode()
+            refreshProgressView()
+            updateActionState()
+        }
     }
 
-    private func finishRecording() {
-        guard case .recording = latestState else {
+    private func toggleRecordingPause() {
+        guard case .recording(_, _, _, let isPaused, _) = latestState else { return }
+        if isPaused {
+            TranscriptionOrchestrator.shared.resumeRecording()
+        } else {
+            TranscriptionOrchestrator.shared.pauseRecording()
+        }
+    }
+
+    private func stopRecordingFlow() {
+        switch latestState {
+        case .recording, .preparingAudio, .loadingModel, .downloadingModel:
+            recordingView.showStopping()
+            TranscriptionOrchestrator.shared.stopRecording()
+        default:
             showMainMode()
+        }
+    }
+
+    private func saveRecordingAudio() {
+        guard let folder = selectedFolderURL else {
+            showAlert(title: "Choose a Folder", message: "Choose a folder before saving the recording.")
             return
         }
-        recordingView.showFinishing()
+
+        do {
+            let url = try TranscriptionOrchestrator.shared.savePendingRecording(to: folder)
+            recordingView.showSaved(url: url)
+            selectedFileBeforeRecording = nil
+            refreshFolderForCurrentSource()
+            showMainMode()
+            refreshProgressView()
+            updateActionState()
+        } catch {
+            showAlert(title: "Save Failed", message: error.localizedDescription)
+        }
+    }
+
+    private func discardRecordingAudio() {
+        TranscriptionOrchestrator.shared.discardPendingRecording()
+        latestState = .idle
+        hasRefinedTranscript = false
+        resetElapsedTimer()
+        restoreSelectionAfterCancelledRecording()
         showMainMode()
-        startElapsedTimer()
-        TranscriptionOrchestrator.shared.stopRecording()
+        refreshProgressView()
+        updateActionState()
     }
 
     private func showRecordingMode() {
         mainContainer.isHidden = true
         recordingView.isHidden = false
-        actionGroup.isHidden = true
+        actionGroup.isHidden = false
         topModelStatusLabel.isHidden = true
+        isRecordingInProgress = true
+        updateActionState()
+    }
+
+    private func showStoppedRecordingMode() {
+        mainContainer.isHidden = true
+        recordingView.isHidden = false
+        actionGroup.isHidden = false
+        topModelStatusLabel.isHidden = true
+        isRecordingInProgress = false
+        updateActionState()
     }
 
     private func showMainMode() {
@@ -438,6 +556,20 @@ final class MainWindow: NSWindow, NSWindowDelegate {
         recordingView.isHidden = true
         actionGroup.isHidden = false
         topModelStatusLabel.isHidden = false
+        isRecordingInProgress = false
+        updateActionState()
+    }
+
+    private func restoreSelectionAfterCancelledRecording() {
+        guard selectedFile == nil else { return }
+        if let previous = selectedFileBeforeRecording {
+            selectedFile = previous
+            selectedFileBeforeRecording = nil
+            sidebarView.select(url: previous.url)
+            transcriptView.showSelectedFile(previous)
+        } else {
+            transcriptView.showSelectedFile(nil)
+        }
     }
 
     private func refreshFolderAfterCompletion() {
@@ -620,6 +752,18 @@ final class MainWindow: NSWindow, NSWindowDelegate {
             )
         }
 
+        if case .completed = latestState, TranscriptionOrchestrator.shared.hasUnsavedRecording {
+            return ProgressDisplayModel(
+                leftLabel: "0:00",
+                centerLabel: "100%",
+                rightLabel: "--:--",
+                progress: 1,
+                elapsed: elapsed,
+                buttonTitle: "Save Recording",
+                buttonEnabled: true
+            )
+        }
+
         let audioProgress = progressValue(for: latestState)
         let duration = selectedFile?.duration
         let leftLabel = audioProgress > 0 && duration != nil
@@ -664,9 +808,9 @@ final class MainWindow: NSWindow, NSWindowDelegate {
         case .extractingAudio:
             return 0
         case .loadingModel:
-            return 0.01
-        case .preparingAudio:
             return 0.02
+        case .preparingAudio:
+            return 0.01
         case .diarizing(let value):
             return value
         case .refining:
@@ -764,13 +908,22 @@ final class MainWindow: NSWindow, NSWindowDelegate {
     private func updateActionState() {
         let hasText = transcriptView.hasExportableText && !latestState.isBusy
         for case let button as NSButton in actionGroup.arrangedSubviews {
-            button.isEnabled = hasText || button.action == #selector(settingsClicked)
-            button.alphaValue = button.isEnabled ? 1 : 0.45
+            let enabled = !isRecordingInProgress && (hasText || button.action == #selector(settingsClicked))
+            button.isEnabled = enabled
+            button.alphaValue = enabled ? 1 : 0.45
         }
+
+        sidebarView.updateRecordAvailability(
+            canRecord: !latestState.isBusy && !isRefining && AppModelManager.shared.canStartRealtimeRecording,
+            isBusy: latestState.isBusy || isRefining,
+            modelState: AppModelManager.shared.whisperModelState
+        )
     }
 
     @objc private func copyClicked() {
-        copyAll()
+        if copyAll() {
+            showCopyToast()
+        }
     }
 
     @objc private func exportTxtClicked() {
@@ -793,9 +946,30 @@ final class MainWindow: NSWindow, NSWindowDelegate {
         alert.beginSheetModal(for: self)
     }
 
+    private func showCopyToast() {
+        copyToastGeneration += 1
+        let generation = copyToastGeneration
+        copyToastLabel.isHidden = false
+        copyToastLabel.alphaValue = 1
+
+        DispatchQueue.main.asyncAfter(deadline: .now() + 1.2) { [weak self] in
+            guard let self, self.copyToastGeneration == generation else { return }
+            NSAnimationContext.runAnimationGroup { context in
+                context.duration = 0.18
+                self.copyToastLabel.animator().alphaValue = 0
+            } completionHandler: {
+                Task { @MainActor in
+                    guard self.copyToastGeneration == generation else { return }
+                    self.copyToastLabel.isHidden = true
+                }
+            }
+        }
+    }
+
     private func makeSymbolButton(symbol: String, accessibilityLabel: String, action: Selector) -> NSButton {
         let button = NSButton()
         button.isBordered = false
+        button.focusRingType = .none
         button.image = NSImage(systemSymbolName: symbol, accessibilityDescription: accessibilityLabel)
         button.contentTintColor = .labelColor
         button.target = self
@@ -811,6 +985,7 @@ final class MainWindow: NSWindow, NSWindowDelegate {
     private func makeTextButton(_ text: String, accessibilityLabel: String, action: Selector) -> NSButton {
         let button = NSButton(title: text, target: self, action: action)
         button.isBordered = false
+        button.focusRingType = .none
         button.font = .systemFont(ofSize: 12, weight: .bold)
         button.contentTintColor = .labelColor
         button.toolTip = accessibilityLabel
@@ -924,6 +1099,8 @@ private final class FileSidebarView: NSView, NSTableViewDataSource, NSTableViewD
     private let folderPathLabel = NSTextField.label("Choose a folder to list supported files", font: .systemFont(ofSize: 12), color: .secondaryLabelColor)
     private let countLabel = NSTextField.label("0", font: .systemFont(ofSize: 13, weight: .semibold), color: .secondaryLabelColor)
     private let tableView = NSTableView()
+    private let recordButton = NSButton()
+    private let recordStatusLabel = NSTextField.label("Preparing model...", font: .systemFont(ofSize: 12, weight: .semibold), color: .secondaryLabelColor)
     private var items: [VoxFileItem] = []
     private var selectedURL: URL?
     private var isUpdatingSelection = false
@@ -965,6 +1142,28 @@ private final class FileSidebarView: NSView, NSTableViewDataSource, NSTableViewD
         }
         isUpdatingSelection = false
         tableView.reloadData()
+    }
+
+    func updateRecordAvailability(canRecord: Bool, isBusy: Bool, modelState: AppModelManagerState) {
+        recordButton.isEnabled = canRecord
+        recordButton.alphaValue = canRecord ? 1 : 0.42
+        recordButton.layer?.backgroundColor = (canRecord ? NSColor.systemRed : NSColor.tertiaryLabelColor).cgColor
+
+        if isBusy {
+            recordStatusLabel.stringValue = "Busy"
+        } else {
+            switch modelState {
+            case .ready:
+                recordStatusLabel.stringValue = "Record"
+            case .downloading:
+                recordStatusLabel.stringValue = "Downloading model..."
+            case .loading, .downloaded, .notDownloaded:
+                recordStatusLabel.stringValue = "Preparing model..."
+            case .error:
+                recordStatusLabel.stringValue = "Model unavailable"
+            }
+        }
+        recordButton.toolTip = recordStatusLabel.stringValue
     }
 
     func numberOfRows(in tableView: NSTableView) -> Int {
@@ -1077,7 +1276,6 @@ private final class FileSidebarView: NSView, NSTableViewDataSource, NSTableViewD
         recordDock.layer?.backgroundColor = NSColor.voxSidebarBackground.cgColor
         addSubview(recordDock)
 
-        let recordButton = NSButton()
         recordButton.title = ""
         recordButton.attributedTitle = NSAttributedString(string: "")
         recordButton.alternateTitle = ""
@@ -1091,6 +1289,10 @@ private final class FileSidebarView: NSView, NSTableViewDataSource, NSTableViewD
         recordButton.layer?.backgroundColor = NSColor.systemRed.cgColor
         recordButton.toolTip = "Record"
         recordDock.addSubview(recordButton)
+
+        recordStatusLabel.alignment = .center
+        recordStatusLabel.lineBreakMode = .byTruncatingTail
+        recordDock.addSubview(recordStatusLabel)
 
         NSLayoutConstraint.activate([
             folderCard.leadingAnchor.constraint(equalTo: leadingAnchor),
@@ -1144,9 +1346,13 @@ private final class FileSidebarView: NSView, NSTableViewDataSource, NSTableViewD
             recordDock.heightAnchor.constraint(equalToConstant: 110),
 
             recordButton.centerXAnchor.constraint(equalTo: recordDock.centerXAnchor),
-            recordButton.centerYAnchor.constraint(equalTo: recordDock.centerYAnchor),
+            recordButton.centerYAnchor.constraint(equalTo: recordDock.centerYAnchor, constant: -8),
             recordButton.widthAnchor.constraint(equalToConstant: 70),
-            recordButton.heightAnchor.constraint(equalToConstant: 70)
+            recordButton.heightAnchor.constraint(equalToConstant: 70),
+
+            recordStatusLabel.leadingAnchor.constraint(equalTo: recordDock.leadingAnchor, constant: 12),
+            recordStatusLabel.trailingAnchor.constraint(equalTo: recordDock.trailingAnchor, constant: -12),
+            recordStatusLabel.topAnchor.constraint(equalTo: recordButton.bottomAnchor, constant: 5)
         ])
     }
 
@@ -1173,6 +1379,7 @@ private final class FileSidebarView: NSView, NSTableViewDataSource, NSTableViewD
     }
 
     @objc private func recordClicked() {
+        guard recordButton.isEnabled else { return }
         onRecord?()
     }
 }
@@ -1285,8 +1492,8 @@ private final class TranscriptPanelView: NSView {
                 hasExportableText = true
                 setText(partialText, color: .labelColor)
             }
-        case .recording(let confirmedText, let pendingText, _):
-            statusLabel.stringValue = "Recording"
+        case .recording(let confirmedText, let pendingText, _, let isPaused, _):
+            statusLabel.stringValue = isPaused ? "Paused" : "Recording"
             statusLabel.textColor = .secondaryLabelColor
             statusLabel.toolTip = nil
             hasExportableText = !confirmedText.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
@@ -1340,11 +1547,11 @@ private final class TranscriptPanelView: NSView {
         hasExportableText = !currentText.isEmpty
     }
 
-    func copyAll() {
+    func copyAll() -> Bool {
         let text = currentText
-        guard hasExportableText, !text.isEmpty else { return }
+        guard hasExportableText, !text.isEmpty else { return false }
         NSPasteboard.general.clearContents()
-        NSPasteboard.general.setString(text, forType: .string)
+        return NSPasteboard.general.setString(text, forType: .string)
     }
 
     private func setup() {
@@ -1586,7 +1793,21 @@ private final class TranscriptionProgressView: NSView {
 }
 
 private final class RecordingWorkspaceView: NSView {
-    var onDone: (() -> Void)?
+    var onPauseResume: (() -> Void)?
+    var onStop: (() -> Void)?
+    var onSave: (() -> Void)?
+    var onDiscard: (() -> Void)?
+
+    private enum LeftControlMode {
+        case pauseResume
+        case discard
+        case close
+    }
+
+    private enum RightControlMode {
+        case stop
+        case save
+    }
 
     private let titleLabel = NSTextField.label("New Recording", font: .systemFont(ofSize: 24, weight: .bold), color: .labelColor)
     private let subtitleLabel = NSTextField.label("", font: .systemFont(ofSize: 13, weight: .semibold), color: .secondaryLabelColor)
@@ -1594,7 +1815,11 @@ private final class RecordingWorkspaceView: NSView {
     private let waveView = RecordingWaveView()
     private let timerLabel = NSTextField.label("00:00.00", font: .monospacedDigitSystemFont(ofSize: 46, weight: .bold), color: .labelColor)
     private let stateLabel = NSTextField.label("Recording", font: .systemFont(ofSize: 15, weight: .bold), color: .systemRed)
-    private let doneButton = NSButton(title: "Done", target: nil, action: nil)
+    private let controlsStack = NSStackView()
+    private let leftButton = NSButton()
+    private let rightButton = NSButton()
+    private var leftControlMode: LeftControlMode = .pauseResume
+    private var rightControlMode: RightControlMode = .stop
 
     override init(frame frameRect: NSRect) {
         super.init(frame: frameRect)
@@ -1610,35 +1835,75 @@ private final class RecordingWorkspaceView: NSView {
         subtitleLabel.stringValue = "\(folderName) · preparing microphone"
         timerLabel.stringValue = "00:00.00"
         stateLabel.stringValue = "Preparing"
-        doneButton.isEnabled = false
-        setText("Preparing microphone...")
+        configurePauseResumeButton(paused: false, enabled: false)
+        configureStopButton(enabled: true)
+        setText("")
+        waveView.progress = 0
     }
 
     func update(state: VoxTranscriptionState) {
         switch state {
-        case .recording(let confirmed, let pending, let duration):
-            subtitleLabel.stringValue = "Recording audio"
+        case .preparingAudio, .loadingModel, .downloadingModel:
+            subtitleLabel.stringValue = state.text
+            stateLabel.stringValue = "Preparing"
+            stateLabel.textColor = .secondaryLabelColor
+            configurePauseResumeButton(paused: false, enabled: false)
+            configureStopButton(enabled: true)
+            setText("")
+        case .recording(let confirmed, let pending, let duration, let isPaused, let modelState):
+            subtitleLabel.stringValue = isPaused ? "Paused" : Self.recordingSubtitle(for: modelState)
             timerLabel.stringValue = Self.timerString(duration)
-            stateLabel.stringValue = "Recording"
-            doneButton.isEnabled = true
+            stateLabel.stringValue = isPaused ? "Paused" : "Recording"
+            stateLabel.textColor = isPaused ? .secondaryLabelColor : .systemRed
+            configurePauseResumeButton(paused: isPaused, enabled: true)
+            configureStopButton(enabled: true)
             setRecordingText(confirmed: confirmed, pending: pending)
             waveView.progress = min(1, duration.truncatingRemainder(dividingBy: 20) / 20)
         case .completed(let text):
-            stateLabel.stringValue = "Completed"
-            doneButton.isEnabled = true
-            setText(text)
+            subtitleLabel.stringValue = "Stopped · save audio if you want to keep the recording"
+            stateLabel.stringValue = "Stopped"
+            stateLabel.textColor = .secondaryLabelColor
+            configureDiscardButton(title: "Discard Audio")
+            configureSaveButton(enabled: TranscriptionOrchestrator.shared.hasUnsavedRecording)
+            setText(text.isEmpty ? "No speech was detected." : text, color: .labelColor)
         case .error(let message):
+            subtitleLabel.stringValue = "Recording stopped"
             stateLabel.stringValue = "Failed"
-            doneButton.isEnabled = true
-            setText(message)
+            stateLabel.textColor = .systemRed
+            configureCloseButton()
+            configureSaveButton(enabled: false)
+            setText(message, color: .systemRed)
         default:
             break
         }
     }
 
-    func showFinishing() {
-        stateLabel.stringValue = "Finishing"
-        doneButton.isEnabled = false
+    func showStopping() {
+        stateLabel.stringValue = "Stopping"
+        stateLabel.textColor = .secondaryLabelColor
+        leftButton.isEnabled = false
+        rightButton.isEnabled = false
+    }
+
+    func showSaved(url: URL) {
+        subtitleLabel.stringValue = "Saved to \(url.lastPathComponent)"
+        stateLabel.stringValue = "Saved"
+        stateLabel.textColor = .secondaryLabelColor
+        configureCloseButton()
+        configureSaveButton(enabled: false)
+    }
+
+    private static func recordingSubtitle(for modelState: AppModelManagerState) -> String {
+        switch modelState {
+        case .ready:
+            return "Recording audio"
+        case .downloading(let progress):
+            return "Recording · Downloading model \(Int(progress * 100))%"
+        case .loading, .downloaded, .notDownloaded:
+            return "Recording · Loading model..."
+        case .error:
+            return "Recording · Model unavailable"
+        }
     }
 
     private func setup() {
@@ -1676,15 +1941,16 @@ private final class RecordingWorkspaceView: NSView {
         timerLabel.alignment = .center
         addSubview(timerLabel)
 
-        doneButton.target = self
-        doneButton.action = #selector(doneClicked)
-        doneButton.isBordered = false
-        doneButton.font = .systemFont(ofSize: 16, weight: .bold)
-        doneButton.translatesAutoresizingMaskIntoConstraints = false
-        doneButton.wantsLayer = true
-        doneButton.layer?.cornerRadius = 24
-        doneButton.layer?.backgroundColor = NSColor.voxControlBackground.cgColor
-        addSubview(doneButton)
+        controlsStack.orientation = .horizontal
+        controlsStack.alignment = .centerY
+        controlsStack.spacing = 30
+        controlsStack.translatesAutoresizingMaskIntoConstraints = false
+        addSubview(controlsStack)
+
+        setupControlButton(leftButton, action: #selector(leftControlClicked))
+        setupControlButton(rightButton, action: #selector(rightControlClicked))
+        controlsStack.addArrangedSubview(leftButton)
+        controlsStack.addArrangedSubview(rightButton)
 
         NSLayoutConstraint.activate([
             titleLabel.centerXAnchor.constraint(equalTo: centerXAnchor),
@@ -1705,40 +1971,170 @@ private final class RecordingWorkspaceView: NSView {
             waveView.heightAnchor.constraint(equalToConstant: 64),
 
             stateLabel.leadingAnchor.constraint(equalTo: leadingAnchor, constant: 24),
-            stateLabel.bottomAnchor.constraint(equalTo: bottomAnchor, constant: -34),
+            stateLabel.centerYAnchor.constraint(equalTo: controlsStack.centerYAnchor),
             stateLabel.widthAnchor.constraint(equalToConstant: 150),
 
             timerLabel.centerXAnchor.constraint(equalTo: centerXAnchor),
-            timerLabel.bottomAnchor.constraint(equalTo: bottomAnchor, constant: -26),
+            timerLabel.bottomAnchor.constraint(equalTo: controlsStack.topAnchor, constant: -16),
 
-            doneButton.trailingAnchor.constraint(equalTo: trailingAnchor, constant: -34),
-            doneButton.centerYAnchor.constraint(equalTo: stateLabel.centerYAnchor),
-            doneButton.widthAnchor.constraint(equalToConstant: 92),
-            doneButton.heightAnchor.constraint(equalToConstant: 48)
+            controlsStack.centerXAnchor.constraint(equalTo: centerXAnchor),
+            controlsStack.bottomAnchor.constraint(equalTo: bottomAnchor, constant: -26),
+
+            leftButton.widthAnchor.constraint(greaterThanOrEqualToConstant: 104),
+            leftButton.heightAnchor.constraint(equalToConstant: 32),
+            rightButton.widthAnchor.constraint(greaterThanOrEqualToConstant: 88),
+            rightButton.heightAnchor.constraint(equalToConstant: 32)
         ])
     }
 
-    private func setText(_ text: String) {
+    private func setupControlButton(_ button: NSButton, action: Selector) {
+        button.target = self
+        button.action = action
+        button.isBordered = false
+        button.font = .systemFont(ofSize: 15, weight: .bold)
+        button.imagePosition = .noImage
+        button.translatesAutoresizingMaskIntoConstraints = false
+        button.wantsLayer = false
+        button.setButtonType(.momentaryChange)
+    }
+
+    private func configurePauseResumeButton(paused: Bool, enabled: Bool) {
+        leftControlMode = .pauseResume
+        configureTextButton(
+            leftButton,
+            title: paused ? "Resume" : "Pause",
+            color: .labelColor,
+            enabled: enabled
+        )
+    }
+
+    private func configureDiscardButton(title: String) {
+        leftControlMode = .discard
+        configureTextButton(
+            leftButton,
+            title: title,
+            color: .labelColor,
+            enabled: true
+        )
+    }
+
+    private func configureCloseButton() {
+        leftControlMode = .close
+        configureTextButton(
+            leftButton,
+            title: "Close",
+            color: .labelColor,
+            enabled: true
+        )
+    }
+
+    private func configureStopButton(enabled: Bool) {
+        rightControlMode = .stop
+        configureTextButton(
+            rightButton,
+            title: "Stop",
+            color: .systemRed,
+            enabled: enabled
+        )
+    }
+
+    private func configureSaveButton(enabled: Bool) {
+        rightControlMode = .save
+        configureTextButton(
+            rightButton,
+            title: enabled ? "Save Audio" : "Saved",
+            color: enabled ? .systemBlue : .secondaryLabelColor,
+            enabled: enabled
+        )
+    }
+
+    private func configureTextButton(
+        _ button: NSButton,
+        title: String,
+        color: NSColor,
+        enabled: Bool
+    ) {
+        button.title = title
+        button.image = nil
+        button.toolTip = title
+        button.isEnabled = enabled
+        button.alphaValue = enabled ? 1 : 0.55
+        button.attributedTitle = NSAttributedString(
+            string: title,
+            attributes: [
+                .font: NSFont.systemFont(ofSize: 15, weight: .bold),
+                .foregroundColor: enabled ? color : NSColor.secondaryLabelColor
+            ]
+        )
+    }
+
+    private func setText(_ text: String, color: NSColor = .secondaryLabelColor) {
         textView.textStorage?.setAttributedString(NSAttributedString(
             string: text,
             attributes: [
                 .font: NSFont.systemFont(ofSize: 20, weight: .semibold),
-                .foregroundColor: NSColor.secondaryLabelColor,
+                .foregroundColor: color,
                 .paragraphStyle: TranscriptPanelView.paragraphStyle()
             ]
         ))
+        scrollToBottom()
     }
 
     private func setRecordingText(confirmed: String, pending: String) {
-        let text = [confirmed, pending]
-            .map { $0.trimmingCharacters(in: .whitespacesAndNewlines) }
-            .filter { !$0.isEmpty && $0 != "Waiting for speech..." }
-            .joined(separator: "\n\n")
-        setText(text)
+        let attributed = NSMutableAttributedString()
+        let confirmedText = confirmed.trimmingCharacters(in: .whitespacesAndNewlines)
+        let pendingText = pending.trimmingCharacters(in: .whitespacesAndNewlines)
+
+        if !confirmedText.isEmpty {
+            attributed.append(NSAttributedString(
+                string: confirmedText,
+                attributes: [
+                    .font: NSFont.systemFont(ofSize: 20, weight: .semibold),
+                    .foregroundColor: NSColor.labelColor,
+                    .paragraphStyle: TranscriptPanelView.paragraphStyle()
+                ]
+            ))
+        }
+
+        if !pendingText.isEmpty && pendingText != "Waiting for speech..." {
+            if attributed.length > 0 {
+                attributed.append(NSAttributedString(string: "\n\n"))
+            }
+            attributed.append(NSAttributedString(
+                string: pendingText,
+                attributes: [
+                    .font: NSFont.systemFont(ofSize: 20, weight: .semibold),
+                    .foregroundColor: NSColor.secondaryLabelColor,
+                    .paragraphStyle: TranscriptPanelView.paragraphStyle()
+                ]
+            ))
+        }
+
+        textView.textStorage?.setAttributedString(attributed)
+        scrollToBottom()
     }
 
-    @objc private func doneClicked() {
-        onDone?()
+    private func scrollToBottom() {
+        guard let textStorage = textView.textStorage else { return }
+        textView.scrollRangeToVisible(NSRange(location: textStorage.length, length: 0))
+    }
+
+    @objc private func leftControlClicked() {
+        switch leftControlMode {
+        case .pauseResume:
+            onPauseResume?()
+        case .discard, .close:
+            onDiscard?()
+        }
+    }
+
+    @objc private func rightControlClicked() {
+        switch rightControlMode {
+        case .stop:
+            onStop?()
+        case .save:
+            onSave?()
+        }
     }
 
     private static func timerString(_ duration: TimeInterval) -> String {

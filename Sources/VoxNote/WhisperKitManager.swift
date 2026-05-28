@@ -37,6 +37,10 @@ final class WhisperKitManager: @unchecked Sendable {
         guard let whisperKit = AppModelManager.shared.whisperKit else {
             throw AppError.noWhisperKit
         }
+        guard AudioSignal.containsNonSilentSamples(audioArray) else {
+            onProgress(1, "")
+            return []
+        }
 
         cancellationFlag.reset()
         var options = DecodingOptions(

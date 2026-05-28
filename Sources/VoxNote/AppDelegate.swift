@@ -23,11 +23,21 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
         UserDefaults.standard.set(true, forKey: "hasLaunchedBefore")
         window.show()
+        DispatchQueue.main.async { [weak self] in
+            self?.mainWindow?.show()
+        }
+        Task {
+            try? await AppModelManager.shared.ensureWhisperKitReady { _ in }
+        }
     }
 
     func applicationShouldHandleReopen(_ sender: NSApplication, hasVisibleWindows flag: Bool) -> Bool {
         mainWindow?.show()
         return true
+    }
+
+    func applicationDidBecomeActive(_ notification: Notification) {
+        mainWindow?.show()
     }
 
     func applicationWillTerminate(_ notification: Notification) {
